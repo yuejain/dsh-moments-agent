@@ -1,0 +1,14 @@
+{
+  "_comment": "Windows 桌面执行器扁平配置示例。CLI 参数优先于本文件。真实 token 不要写在这里。",
+  "host": "127.0.0.1",
+  "port": 18765,
+  "mode": "PREPARE_ONLY",
+  "allowPublish": false,
+  "tokenFile": "data/desktop-token.txt",
+  "screenshotDir": "data/desktop/screenshots",
+  "assetRoots": ["data/assets", "data/imports"],
+  "logFile": "data/desktop/executor.log",
+  "expectedAccountId": "",
+  "supportedVersions": ["4.1.10.27"],
+  "requestTimeoutMs": 30000
+}

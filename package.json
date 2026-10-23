@@ -1,0 +1,68 @@
+{
+  "name": "dsh-moments-agent",
+  "version": "0.2.0",
+  "private": true,
+  "description": "DSH Moments Agent：以 DeepSeek Harness 为底座、面向 Windows 个人微信朋友圈的数字化人格创作与审批发布插件",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "cordis.patch.yml",
+    "locale",
+    "icon.svg",
+    "persona",
+    "config",
+    "desktop/*.py",
+    "desktop/requirements.txt",
+    "client/*.py",
+    "client/web/*.js",
+    "client/web/*.css",
+    "client/web/*.html",
+    "scripts",
+    "README.md",
+    "LICENSE",
+    "licenses",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "icon": "./icon.svg",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test --test-isolation=none \"tests/unit/*.test.mjs\" \"tests/integration/*.test.mjs\"",
+    "test:unit": "npm run build && node --test --test-isolation=none \"tests/unit/*.test.mjs\"",
+    "test:integration": "npm run build && node --test --test-isolation=none \"tests/integration/*.test.mjs\"",
+    "test:e2e": "node scripts/verify.mjs",
+    "test:desktop": "python desktop/tests/run_tests.py",
+    "test:client": "python -X utf8 -m unittest discover -s client/tests -v",
+    "test:coverage": "npm run build && node --test --test-isolation=none --experimental-test-coverage --test-coverage-include=\"src/**\" --test-coverage-include=\"dist/**\" \"tests/unit/*.test.mjs\" \"tests/integration/*.test.mjs\"",
+    "verify": "node scripts/verify.mjs",
+    "desktop": "python desktop/server.py --token-file data/desktop-token.txt"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "sharp": "0.35.5"
+  }
+}

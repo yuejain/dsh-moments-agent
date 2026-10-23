@@ -1,0 +1,47 @@
+# dsh-moments-agent 默认 bundle patch。
+#
+# 语法：顶层为数组；insert 追加行。config 整行替换、不深合并，
+# 因此这里只写默认值；用户在自己的 profile cordis.patch.yml 中按 id
+# 覆盖同名列即可。所有安全敏感开关默认关闭：默认仅 PREPARE_ONLY，
+# 不自动发表，不自动产生付费图像 API 调用。
+- insert:
+    - id: dsh-moments-agent
+      name: dsh-moments-agent
+      config:
+        enabled: true
+        dataDir: data
+        publishMode: PREPARE_ONLY
+        killSwitch: false
+        scheduleEnabled: false
+        ownerChannel: manual
+        llm:
+          provider: deepseek-account
+          model: deepseek-flash
+          reasoningEffort: high
+          temperature: 0.8
+          timeoutMs: 90000
+        wechatAgent:
+          enabled: false
+          readerBaseUrl: http://127.0.0.1:11231
+          hookBaseUrl: http://127.0.0.1:11230
+          account: ''
+          ownerWxid: ''
+        desktopExecutor:
+          enabled: false
+          baseUrl: http://127.0.0.1:18765
+        images:
+          providers:
+            - manual-subscription
+            - local-import
+          officialApiEnabled: false
+        adminServer:
+          enabled: true
+          port: 18766
+          tokenFile: data/admin-token.txt
+        policy:
+          dailyLimit: 2
+          minIntervalMinutes: 180
+          quietHours: ['23:00', '08:00']
+          requireApproval: true
+          approvalTtlMinutes: 120
+          minScoreToPublish: 0.62

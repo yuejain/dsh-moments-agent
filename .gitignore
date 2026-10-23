@@ -1,0 +1,17 @@
+node_modules/
+dist/
+data/
+.tmp/
+release/
+coverage/
+.env
+.env.*
+!.env.example
+*.log
+*.sqlite*
+*.db
+__pycache__/
+*.pyc
+**/.test-tmp/
+**/.tmp-web-test/
+client/moments-client.json

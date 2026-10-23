@@ -1,0 +1,82 @@
+# DSH Moments Agent 配置示例
+#
+# 用法：把下面这段追加/合并到
+#   C:\Users\<你>\.dsh\profiles\desktop\cordis.patch.yml
+# 或在 DSH 插件管理页中编辑该插件行的 config。
+#
+# 注意：patch 层的 config 是“整行替换、不深合并”，这里只写需要覆盖的字段；
+# 未写字段使用 src/config.ts 中的默认值（默认最保守：PREPARE_ONLY、无调度、无自动发布）。
+
+- id: dsh-moments-agent
+  name: dsh-moments-agent
+  config:
+    enabled: true
+    # 插件数据目录：相对插件包根目录，或绝对路径
+    dataDir: data
+    # PREPARE_ONLY（默认，只准备图文，绝不发表）
+    # APPROVAL_REQUIRED（有一次性审批 + 桌面执行器 --allow-publish 时才可发表）
+    # POLICY_AUTONOMOUS（默认禁用；还需环境变量 DSH_MOMENTS_ALLOW_AUTONOMOUS_PUBLISH=1）
+    publishMode: PREPARE_ONLY
+    killSwitch: false
+    # 自主创作调度：默认关闭；打开后也只会生成草稿并请求审批，不会自动发表
+    scheduleEnabled: false
+    # manual（本机管理页审批）/ wechat（微信所有者命令）/ both
+    ownerChannel: manual
+    llm:
+      provider: deepseek-account
+      model: deepseek-flash
+      reasoningEffort: high
+      temperature: 0.8
+      timeoutMs: 90000
+    wechatAgent:
+      enabled: false
+      readerBaseUrl: http://127.0.0.1:11231
+      hookBaseUrl: http://127.0.0.1:11230
+      # 从 WeChatAgent 的 state/wechat-io-config.json 读取 reader_base_url/token（可选）
+      readerConfigPath: null
+      readerTokenFile: null
+      hookTokenFile: null
+      account: ''
+      # 只有该 wxid 发送的 /moments 命令才会被接受
+      ownerWxid: ''
+      pollIntervalMs: 15000
+    desktopExecutor:
+      enabled: false
+      baseUrl: http://127.0.0.1:18765
+      tokenFile: null
+      timeoutMs: 120000
+    images:
+      # 按顺序尝试；默认只有人工订阅桥与本地导入，不会产生付费调用
+      providers:
+        - manual-subscription
+        - local-import
+      officialApiEnabled: false
+      allowNetworkSearch: false
+      # 显式启用后，会将任务图片发送给上方配置的 DSH 模型进行语义审核/OCR。
+      # 默认只做本地结构检查；启用时模型或附件服务不可用则拒绝图片。
+      semanticReviewEnabled: false
+      maxFileBytes: 12582912
+      allowedAspectRatios: ['1:1', '4:3', '3:4', '16:9', '9:16']
+      assetDir: assets
+    policy:
+      dailyLimit: 2
+      minIntervalMinutes: 180
+      quietHours: ['23:00', '08:00']
+      requireApproval: true
+      approvalTtlMinutes: 120
+      minScoreToPublish: 0.62
+      timeZone: Asia/Shanghai
+      maxTextLength: 2000
+      maxImages: 9
+    scheduler:
+      tickSeconds: 60
+      ideaProbability: 0.05
+      jitterSeconds: 0
+    adminServer:
+      # 本机管理页：http://127.0.0.1:18766/ ，令牌见 data/admin-token.txt
+      enabled: false
+      port: 18766
+      tokenFile: null
+    workspace:
+      personaFile: persona/SOUL.md
+      visualStyleFile: persona/VISUAL_STYLE.md

@@ -1,0 +1,5 @@
+# Windows 桌面执行器核心与测试仅需 Python 标准库。
+# 真实 UI Automation 可选依赖（仍需对目标微信版本实机验收）：
+# pywinauto>=0.6.9
+# comtypes>=1.2.0
+# 缺少依赖时 GUI 操作返回 DESKTOP_UNSUPPORTED。
