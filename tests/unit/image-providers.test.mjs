@@ -252,13 +252,16 @@ function comfyMock(options = {}) {
     calls.push({ url, method: init.method ?? 'GET' });
     if (url.endsWith('/system_stats')) {
       if (options.systemStatsDown === true) throw new Error('ECONNREFUSED');
-      return jsonResponse({ system: { os: 'nt' } });
+      return jsonResponse(options.stats ?? { system: { os: 'nt', ram_free: 8 * 1024 ** 3 }, devices: [{ type: 'cpu', vram_total: 16 * 1024 ** 3, vram_free: 8 * 1024 ** 3 }] });
     }
     if (url.endsWith('/object_info')) {
       if (options.objectInfoDown === true) return jsonResponse({});
       if (checkpoints.length === 0) return jsonResponse({ CheckpointLoaderSimple: { input: { required: { ckpt_name: [[]] } } } });
-      return jsonResponse({ CheckpointLoaderSimple: { input: { required: { ckpt_name: [checkpoints] } } } });
+      const nodes = Object.fromEntries(['CLIPTextEncode', 'EmptyLatentImage', 'KSampler', 'VAEDecode', 'SaveImage'].map(name => [name, {}]));
+      delete nodes[options.missingNode];
+      return jsonResponse({ ...nodes, CheckpointLoaderSimple: { input: { required: { ckpt_name: [checkpoints] } } } });
     }
+    if (url.endsWith('/queue')) return jsonResponse(options.queue ?? { queue_running: [], queue_pending: [] }, { ok: !options.queueDown, status: options.queueDown ? 503 : 200 });
     if (url.endsWith('/prompt')) {
       if (options.rejectPrompt === true) return jsonResponse({ error: 'bad workflow' }, { ok: false, status: 400 });
       return jsonResponse({ prompt_id: 'prompt-1' });
@@ -273,6 +276,26 @@ function comfyMock(options = {}) {
   };
   return { fetch: fetchImpl, calls, get historyCallCount() { return historyCallCount; } };
 }
+
+test('LocalGeneration：预检拒绝缺失节点、资源未知、内存不足及繁忙/异常队列且不提交', async () => {
+  const scenarios = [
+    [{ missingNode: 'VAEDecode' }, /VAEDecode/],
+    [{ stats: {} }, /内存/],
+    [{ stats: { system: { ram_free: 100 } } }, /512 MiB/],
+    [{ stats: { system: { ram_free: 8 * 1024 ** 3 }, devices: [] } }, /设备/],
+    [{ queue: {} }, /队列状态未知/],
+    [{ queue: { queue_running: [{}], queue_pending: Array(7).fill({}) } }, /队列繁忙/],
+    [{ queueDown: true }, /HTTP 503/],
+  ];
+  for (const [options, reason] of scenarios) {
+    const mock = comfyMock(options);
+    const provider = new LocalGenerationProvider({ fetch: mock.fetch });
+    const result = await provider.generate(generationRequest());
+    assert.equal(result.status, 'unavailable');
+    assert.match(result.message, reason);
+    assert.ok(!mock.calls.some(call => call.method === 'POST'), '预检失败不能提交任务');
+  }
+});
 
 test('LocalGeneration：非回环地址直接不可用', async () => {
   const mock = comfyMock();

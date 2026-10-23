@@ -1,6 +1,6 @@
 # DSH Moments Agent
 
-基于 DeepSeek Harness 的 Windows 朋友圈创作、配图、审核与审批插件。当前为 **0.2.0 预发布版本**，不是已完成实机验收的自动发布产品。
+基于 DeepSeek Harness 的 Windows 朋友圈创作、配图、审核与审批插件。当前为 **0.2.1 预发布版本**，不是已完成实机验收的自动发布产品。
 
 ## 能力
 
@@ -40,7 +40,8 @@ python client/server.py --admin-url http://127.0.0.1:18766 --token-file data/adm
 - 微信 4.x Qt 控件树可能不可访问；真实 prepare/publish/verify 尚未完成可靠验收。Mock 测试通过不代表真实朋友圈发表成功。
 - 多模态审图已实现并通过 Mock 测试，尚未完成真实模型准确性验收；不能保证检测所有隐私或误导内容。
 - 图片编辑目前通过人工桥；ComfyUI/官方 API 自动编辑未接入。
-- 公开许可图片检索、正式 Codex 文本子任务委派、本地生成完整资源预检仍未完成。
+- 本地生图已检查模型、工作流节点、可用内存、设备状态及队列（至少 8 项时暂缓）；512 MiB 内存下限仅排除明显资源不足，不能保证模型可运行。ComfyUI 输出目录写权限和磁盘空间尚未预检。API 字段依据 [ComfyUI 服务端](https://github.com/comfyanonymous/ComfyUI/blob/master/server.py)。
+- 公开许可图片检索、正式 Codex 文本子任务委派仍未完成。
 - 社区订阅图像适配器未完成授权验证，返回 UNSUPPORTED_AUTHORIZATION；不读取 Cookie 或调用私有端点。
 - 本仓库不包含真实账号、聊天记录、数据库、实机截图、Hook 二进制或本地历史验收档案。
 

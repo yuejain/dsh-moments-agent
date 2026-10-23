@@ -1,6 +1,6 @@
 {
   "name": "dsh-moments-agent",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "DSH Moments Agent：以 DeepSeek Harness 为底座、面向 Windows 个人微信朋友圈的数字化人格创作与审批发布插件",
   "license": "MIT",
@@ -52,7 +52,7 @@
     "test:unit": "npm run build && node --test --test-isolation=none \"tests/unit/*.test.mjs\"",
     "test:integration": "npm run build && node --test --test-isolation=none \"tests/integration/*.test.mjs\"",
     "test:e2e": "node scripts/verify.mjs",
-    "test:desktop": "python desktop/tests/run_tests.py",
+    "test:desktop": "python -X utf8 desktop/tests/run_tests.py",
     "test:client": "python -X utf8 -m unittest discover -s client/tests -v",
     "test:coverage": "npm run build && node --test --test-isolation=none --experimental-test-coverage --test-coverage-include=\"src/**\" --test-coverage-include=\"dist/**\" \"tests/unit/*.test.mjs\" \"tests/integration/*.test.mjs\"",
     "verify": "node scripts/verify.mjs",

@@ -8,6 +8,7 @@ import re
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
@@ -121,6 +122,19 @@ class FakeDriverTest(unittest.TestCase):
 
 
 class RealDriverTest(unittest.TestCase):
+    def test_missing_installation_returns_status_for_clean_windows(self) -> None:
+        for directories in ([], ['C:/missing-wechat']):
+            with self.subTest(directories=directories), \
+                patch('desktop.window_locator._IS_WINDOWS', True), \
+                patch('desktop.window_locator._scan_uninstall_registry', return_value=(directories, None, [], [])), \
+                patch('desktop.window_locator._default_install_candidates', return_value=[]), \
+                patch('desktop.window_locator._path_exists_file', return_value=False):
+                installation = WindowLocator().detect_installation()
+                self.assertIsInstance(installation, WechatInstallation)
+                self.assertFalse(installation.installed)
+                self.assertIsNone(installation.exe_path)
+                self.assertTrue(installation.notes)
+
     def setUp(self) -> None:
         self.config = _base_config()
         self.driver = RealWechatDriver(self.config)

@@ -133,7 +133,18 @@ export class LocalGenerationProvider implements ImageProvider {
     if (this.baseUrlError !== null) return unavailable([this.baseUrlError]);
     if (this.fetchImpl === null) return unavailable(['当前运行时不支持 fetch，无法连接本机 ComfyUI']);
     try {
-      await this.requestJson(`${this.baseUrl}/system_stats`, { method: 'GET' }, this.probeTimeoutMs);
+      const stats = record(await this.requestJson(`${this.baseUrl}/system_stats`, { method: 'GET' }, this.probeTimeoutMs));
+      const ramFree = record(stats?.system)?.ram_free;
+      if (typeof ramFree !== 'number' || !Number.isFinite(ramFree) || ramFree < 512 * 1024 * 1024) {
+        return unavailable(['ComfyUI 可用内存未知或低于 512 MiB，暂不提交生成']);
+      }
+      const devices = stats?.devices;
+      if (!Array.isArray(devices) || !devices.some((item) => {
+        const device = record(item);
+        return typeof device?.type === 'string' && device.type.length > 0 &&
+          typeof device.vram_total === 'number' && Number.isFinite(device.vram_total) && device.vram_total > 0 &&
+          typeof device.vram_free === 'number' && Number.isFinite(device.vram_free) && device.vram_free >= 0;
+      })) return unavailable(['ComfyUI 未报告有效 CPU/GPU 设备及显存/内存状态']);
       const objectInfo = await this.requestJson(`${this.baseUrl}/object_info`, { method: 'GET' }, this.probeTimeoutMs);
       const checkpoints = this.extractCheckpoints(objectInfo);
       if (checkpoints.length === 0) {
@@ -142,6 +153,17 @@ export class LocalGenerationProvider implements ImageProvider {
       const chosen = this.requestedCheckpoint ?? checkpoints[0] ?? '';
       if (!checkpoints.includes(chosen)) {
         return unavailable([`ComfyUI 未找到指定 checkpoint：${chosen}；可用模型：${checkpoints.join(', ')}`]);
+      }
+      const nodes = record(objectInfo);
+      const missing = ['CLIPTextEncode', 'EmptyLatentImage', 'KSampler', 'VAEDecode', 'SaveImage']
+        .filter((name) => record(nodes?.[name]) === null);
+      if (missing.length > 0) return unavailable([`ComfyUI 缺少工作流节点：${missing.join(', ')}`]);
+      const queue = record(await this.requestJson(`${this.baseUrl}/queue`, { method: 'GET' }, this.probeTimeoutMs));
+      if (!Array.isArray(queue?.queue_running) || !Array.isArray(queue?.queue_pending)) {
+        return unavailable(['ComfyUI 任务队列状态未知，暂不提交生成']);
+      }
+      if (queue.queue_running.length + queue.queue_pending.length >= 8) {
+        return unavailable(['ComfyUI 任务队列繁忙（至少 8 项），请稍后重试']);
       }
       this.checkpointName = chosen;
       return {
@@ -382,6 +404,7 @@ export class LocalGenerationProvider implements ImageProvider {
     externalSignal?: AbortSignal,
   ): Promise<unknown> {
     const response = await this.request(url, init, timeoutMs, externalSignal);
+    if (!response.ok) throw new Error(`ComfyUI HTTP ${response.status}`);
     try {
       return await response.json();
     } catch {

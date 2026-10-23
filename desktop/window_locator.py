@@ -704,6 +704,7 @@ class WindowLocator:
             notes.append("注册表记录了微信安装目录，但其中没有找到 WeChat.exe/Weixin.exe（可能已卸载残留）")
         else:
             notes.append("未找到微信客户端安装")
+        return WechatInstallation(installed=False, notes=notes)
 
     # -- 截图 -------------------------------------------------------------
 
