@@ -19,3 +19,12 @@ jobs:
       - run: npm run verify
       - run: npm run test:desktop
       - run: npm run test:client
+  desktop-uia:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install pywinauto==0.6.9 comtypes==1.4.17 pywin32==312 six==1.17.0
+      - run: python -X utf8 desktop/tests/run_tests.py

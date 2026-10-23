@@ -420,3 +420,50 @@ test('LocalGeneration：provider.cancel 可中止进行中的生成', async () =
   const result = await pending;
   assert.equal(result.status, 'cancelled');
 });
+
+function blockedPreflight() {
+  const mock = comfyMock();
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  return { calls: mock.calls, release: () => release(), fetch: async (url, init) => {
+    if (url.endsWith('/system_stats')) await gate;
+    return mock.fetch(url, init);
+  } };
+}
+
+test('LocalGeneration：预检期间同任务并发只允许提交一次', async () => {
+  const mock = blockedPreflight();
+  const provider = new LocalGenerationProvider({ fetch: mock.fetch, sleep: async () => {} });
+  const first = provider.generate(generationRequest());
+  const second = provider.generate(generationRequest());
+  mock.release();
+  const results = await Promise.all([first, second]);
+  assert.equal(results[0].status, 'ready');
+  assert.equal(results[1].errorCode, 'CONFLICT');
+  assert.equal(mock.calls.filter(call => call.method === 'POST').length, 1);
+});
+
+test('LocalGeneration：外部取消发生在预检期间也不能提交', async () => {
+  const mock = blockedPreflight();
+  const provider = new LocalGenerationProvider({ fetch: mock.fetch, sleep: async () => {} });
+  const controller = new AbortController();
+  const pending = provider.generate(generationRequest({ signal: controller.signal }));
+  controller.abort();
+  mock.release();
+  assert.equal((await pending).status, 'cancelled');
+  assert.equal(mock.calls.filter(call => call.method === 'POST').length, 0);
+});
+
+test('LocalGeneration：provider.cancel 覆盖预检且完成清理前仍禁止重入', async () => {
+  const mock = blockedPreflight();
+  const provider = new LocalGenerationProvider({ fetch: mock.fetch, sleep: async () => {} });
+  const pending = provider.generate(generationRequest());
+  const cancelled = await provider.cancel('task_image_1');
+  const duplicate = provider.generate(generationRequest());
+  mock.release();
+  const results = await Promise.all([pending, duplicate]);
+  assert.equal(cancelled, true);
+  assert.equal(results[0].status, 'cancelled');
+  assert.equal(results[1].errorCode, 'CONFLICT');
+  assert.equal(mock.calls.filter(call => call.method === 'POST').length, 0);
+});

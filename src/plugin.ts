@@ -9,7 +9,7 @@
  * 插件不在 apply 阶段执行任何外部副作用（不点击、不发微信、不调用付费图像 API）。
  */
 import path from 'node:path';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { MomentsStore } from './storage/store.js';
 import { MomentsRuntime } from './runtime.js';
@@ -33,7 +33,7 @@ import { createDedicatedSession, type AgentService, type PresetService } from '.
 
 export const name = 'dsh-moments-agent';
 export const inject = ['tools'] as const;
-export const version = '0.2.0';
+export const version: string = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
 
 /** DSH 传入的最小 Cordis 上下文；只声明实际使用的成员，便于测试替身。 */
 export interface PluginContextLike {

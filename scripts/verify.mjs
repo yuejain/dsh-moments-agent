@@ -8,7 +8,7 @@
  * 3. SQLite 迁移、工具返回信封、PREPARE_ONLY 默认策略；
  * 4. 卸载时资源可回收。
  */
-import { mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -96,6 +96,7 @@ try {
   assert.equal(health.plugin, 'dsh-moments-agent');
   assert.equal(health.publishMode, 'PREPARE_ONLY');
   assert.equal(health.database, 'ok');
+  assert.equal(health.version, JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')).version, '运行时版本应与安装包一致');
   assert.equal(typeof health.counts, 'object');
 
   const statusTool = tools.get('moments_get_status');

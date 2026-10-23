@@ -121,7 +121,7 @@ export class LocalGenerationProvider implements ImageProvider {
     this.clientId = options.clientId ?? 'dsh-moments-agent';
   }
 
-  async checkCapabilities(): Promise<ImageProviderCapabilities> {
+  async checkCapabilities(signal?: AbortSignal): Promise<ImageProviderCapabilities> {
     const unavailable = (reasons: readonly string[]): ImageProviderCapabilities => ({
       available: false,
       provider: this.id,
@@ -133,7 +133,7 @@ export class LocalGenerationProvider implements ImageProvider {
     if (this.baseUrlError !== null) return unavailable([this.baseUrlError]);
     if (this.fetchImpl === null) return unavailable(['当前运行时不支持 fetch，无法连接本机 ComfyUI']);
     try {
-      const stats = record(await this.requestJson(`${this.baseUrl}/system_stats`, { method: 'GET' }, this.probeTimeoutMs));
+      const stats = record(await this.requestJson(`${this.baseUrl}/system_stats`, { method: 'GET' }, this.probeTimeoutMs, signal));
       const ramFree = record(stats?.system)?.ram_free;
       if (typeof ramFree !== 'number' || !Number.isFinite(ramFree) || ramFree < 512 * 1024 * 1024) {
         return unavailable(['ComfyUI 可用内存未知或低于 512 MiB，暂不提交生成']);
@@ -145,7 +145,7 @@ export class LocalGenerationProvider implements ImageProvider {
           typeof device.vram_total === 'number' && Number.isFinite(device.vram_total) && device.vram_total > 0 &&
           typeof device.vram_free === 'number' && Number.isFinite(device.vram_free) && device.vram_free >= 0;
       })) return unavailable(['ComfyUI 未报告有效 CPU/GPU 设备及显存/内存状态']);
-      const objectInfo = await this.requestJson(`${this.baseUrl}/object_info`, { method: 'GET' }, this.probeTimeoutMs);
+      const objectInfo = await this.requestJson(`${this.baseUrl}/object_info`, { method: 'GET' }, this.probeTimeoutMs, signal);
       const checkpoints = this.extractCheckpoints(objectInfo);
       if (checkpoints.length === 0) {
         return unavailable(['ComfyUI 未暴露可用的 checkpoint 模型（CheckpointLoaderSimple.ckpt_name 为空），无法生成']);
@@ -158,7 +158,7 @@ export class LocalGenerationProvider implements ImageProvider {
       const missing = ['CLIPTextEncode', 'EmptyLatentImage', 'KSampler', 'VAEDecode', 'SaveImage']
         .filter((name) => record(nodes?.[name]) === null);
       if (missing.length > 0) return unavailable([`ComfyUI 缺少工作流节点：${missing.join(', ')}`]);
-      const queue = record(await this.requestJson(`${this.baseUrl}/queue`, { method: 'GET' }, this.probeTimeoutMs));
+      const queue = record(await this.requestJson(`${this.baseUrl}/queue`, { method: 'GET' }, this.probeTimeoutMs, signal));
       if (!Array.isArray(queue?.queue_running) || !Array.isArray(queue?.queue_pending)) {
         return unavailable(['ComfyUI 任务队列状态未知，暂不提交生成']);
       }
@@ -191,13 +191,6 @@ export class LocalGenerationProvider implements ImageProvider {
     if (this.controllers.has(key)) {
       return this.failedResult('同一任务已有 ComfyUI 生成在执行中，已拒绝重复提交', 'CONFLICT');
     }
-    const capabilities = await this.checkCapabilities();
-    if (!capabilities.available) {
-      const result = this.unavailableResult(capabilities.reasons.join('；'), 'IMAGE_PROVIDER_UNAVAILABLE');
-      this.remember(key, result);
-      return result;
-    }
-
     const controller = new AbortController();
     this.controllers.set(key, controller);
     let abortedByUser = false;
@@ -207,6 +200,17 @@ export class LocalGenerationProvider implements ImageProvider {
     };
     request.signal?.addEventListener('abort', onAbort, { once: true });
     try {
+      const capabilities = await this.checkCapabilities(controller.signal);
+      if (controller.signal.aborted) {
+        const result = this.cancelledResult();
+        this.remember(key, result);
+        return result;
+      }
+      if (!capabilities.available) {
+        const result = this.unavailableResult(capabilities.reasons.join('；'), 'IMAGE_PROVIDER_UNAVAILABLE');
+        this.remember(key, result);
+        return result;
+      }
       const size = this.resolveSize(request.resolution, request.aspectRatio);
       const workflow = this.buildWorkflow(request, size);
       const promptId = await this.submit(workflow, controller.signal);
@@ -244,7 +248,7 @@ export class LocalGenerationProvider implements ImageProvider {
       this.remember(key, result);
       return result;
     } catch (error) {
-      if (abortedByUser || (request.signal?.aborted ?? false)) {
+      if (controller.signal.aborted || abortedByUser || (request.signal?.aborted ?? false)) {
         const result = this.cancelledResult();
         this.remember(key, result);
         return result;
@@ -267,7 +271,6 @@ export class LocalGenerationProvider implements ImageProvider {
     const controller = this.controllers.get(taskId);
     if (controller === undefined) return false;
     controller.abort();
-    this.controllers.delete(taskId);
     return true;
   }
 
@@ -420,6 +423,7 @@ export class LocalGenerationProvider implements ImageProvider {
   ): Promise<ComfyFetchResponse> {
     const fetchImpl = this.fetchImpl;
     if (fetchImpl === null) throw new Error('当前运行时不支持 fetch');
+    if (externalSignal?.aborted) throw new Error('cancelled');
     const controller = new AbortController();
     const onAbort = (): void => controller.abort();
     externalSignal?.addEventListener('abort', onAbort, { once: true });
