@@ -14,11 +14,13 @@
     # 插件数据目录：相对插件包根目录，或绝对路径
     dataDir: data
     # PREPARE_ONLY（默认，只准备图文，绝不发表）
-    # APPROVAL_REQUIRED（有一次性审批 + 桌面执行器 --allow-publish 时才可发表）
-    # POLICY_AUTONOMOUS（默认禁用；还需环境变量 DSH_MOMENTS_ALLOW_AUTONOMOUS_PUBLISH=1）
+    # APPROVAL_REQUIRED（审核通过且有有效一次性人工审批才可发表）
+    # POLICY_AUTONOMOUS（审核通过后直接发表，无逐条人工审批）
+    # EXE 设置页保存的三级模式优先于此默认值，并同步内置执行器权限。
     publishMode: PREPARE_ONLY
     killSwitch: false
-    # 自主创作调度：默认关闭；打开后也只会生成草稿并请求审批，不会自动发表
+    # 自主创作调度：默认关闭；按所选模式生成审核内容，第二档额外请求审批。
+    # 发送由 policy.humanize.enabled 独立控制；第三档已审核内容可免审批自动发送。
     scheduleEnabled: false
     # manual（本机管理页审批）/ wechat（微信所有者命令）/ both
     ownerChannel: manual
@@ -68,6 +70,16 @@
       timeZone: Asia/Shanghai
       maxTextLength: 2000
       maxImages: 9
+      # 拟人化自动发送：默认关闭。第二档要求有效审批，第三档接受已审核内容；
+      # 两者均要求执行器允许、账号/内容/额度/时段检查通过；UNCERTAIN 永不自动重试。
+      humanize:
+        enabled: false
+        delaySeconds: [90, 900]
+        activeHours: ['09:00', '22:00']
+        minIntervalSeconds: 3600
+        jitterSeconds: 600
+        maxPublishAttempts: 2
+        backoffSeconds: [60, 180]
     scheduler:
       tickSeconds: 60
       ideaProbability: 0.05
@@ -80,3 +92,16 @@
     workspace:
       personaFile: persona/SOUL.md
       visualStyleFile: persona/VISUAL_STYLE.md
+    # 社交记忆：只读 WeChatAgent「聊天范围」白名单内的会话，提炼人物印象，
+    # 供朋友圈选题/创作弱参考。默认关闭；私聊需单独开启；真实昵称只存本地。
+    chatMemory:
+      enabled: false
+      includePrivate: false
+      conversations: []            # 会话名或 conversationKey；空 = 上游白名单内全部
+      syncIntervalMinutes: 60
+      maxMessagesPerConversation: 200
+      retentionDays: 30            # 消息保留期（天）
+      impressionTtlDays: 90        # 人物印象有效期（天）
+      maxMembersPerConversation: 100
+      anonymizeInPrompts: true     # 保留字段：实现始终匿名（提示词只用「群友A」等别名）
+      useLlmExtraction: true

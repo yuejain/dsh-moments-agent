@@ -21,6 +21,7 @@ import re
 import secrets
 import stat
 import subprocess
+import locale
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,7 +43,7 @@ LOOPBACK_BIND_HOST = "127.0.0.1"
 # POLICY_AUTONOMOUS 是 TypeScript 侧配置枚举的合法值，桌面执行器只把它当作
 # “禁止点击发表”的模式（绝不放大权限）。
 PUBLISH_MODES = frozenset({"PREPARE_ONLY", "APPROVAL_REQUIRED", "POLICY_AUTONOMOUS"})
-CLI_PUBLISH_MODES = ("PREPARE_ONLY", "APPROVAL_REQUIRED")
+CLI_PUBLISH_MODES = ("PREPARE_ONLY", "APPROVAL_REQUIRED", "POLICY_AUTONOMOUS")
 PUBLISH_MODE_APPROVAL_REQUIRED = "APPROVAL_REQUIRED"
 
 VISIBILITIES = frozenset({"PUBLIC", "PRIVATE", "PARTIAL"})
@@ -84,6 +85,10 @@ EXTRA_ERROR_CODES = frozenset(
         # TypeScript 侧错误码：GUI Automation 依赖缺失或控件树未验证时使用。
         "DESKTOP_UNSUPPORTED",
         "UIA_UNAVAILABLE",
+        # 几何驱动（opt-in）错误码：管理员权限 / OCR 不可用 / OCR 超时。
+        "PRIVILEGE_REQUIRED",
+        "OCR_UNAVAILABLE",
+        "OCR_TIMEOUT",
     }
 )
 ALL_ERROR_CODES = PROTOCOL_ERROR_CODES | EXTRA_ERROR_CODES
@@ -99,8 +104,13 @@ RETRYABLE_ERROR_CODES = frozenset(
         "UPLOAD_FAILED",
         "EXECUTOR_BUSY",
         "CANCELLED",
+        "OCR_TIMEOUT",
     }
 )
+
+# 驱动类型：uia（默认，RealWechatDriver）或 geometry（opt-in，微信 4.x 几何/像素）。
+DRIVERS = frozenset({"uia", "geometry"})
+GEOMETRY_DRIVER = "geometry"
 
 # 输入边界
 MAX_BODY_BYTES = 8 * 1024 * 1024
@@ -290,6 +300,28 @@ class ExecutorConfig:
         "WeixinMainWndForPC",
         "Qt51514QWindowIcon",
     )
+    # -- 微信 4.x 几何驱动（opt-in） --------------------------------------
+    # 默认仍使用 UIA 驱动；geometry 必须显式 --driver geometry 才启用。
+    driver: str = "uia"
+    # geometry 模式点击发表需要额外显式授权，且仍受 allow_publish + 第二或第三档 约束。
+    geometry_allow_publish: bool = False
+    geometry_normalize_window: bool = True
+    # 是否强制要求执行器自身具备管理员权限。默认 False = 自动：只有微信进程本身
+    # 提权（UIPI 会拦截同完整性输入）时才要求管理员；微信未提权时允许同完整性驱动。
+    geometry_require_admin: bool = False
+    # OCR 使用 DSH Python 3.12 + desktop/.vendor（winsdk）；None 表示自动探测。
+    ocr_python: str | None = None
+    # 发布点击后的重试上限（0-2），仅在“编辑器仍打开且按钮仍存在”时允许。
+    max_publish_click_retries: int = 1
+    retry_backoff_seconds: float = 2.0
+    # prepare 阶段（打开编辑器/粘贴）总尝试上限，<=3，只重试白名单可恢复错误。
+    max_prepare_attempts: int = 3
+    geometry_long_press_ms: int = 900
+    geometry_wait_after_click: float = 1.5
+    # 右键上下文菜单「粘贴」的安全 fallback 偏移（相对文本区点击点）。
+    # 实测微信 4.1.10.27：菜单出现在光标右下方，「粘贴」项中心约 +(40, 34)。
+    geometry_paste_fallback_offset: tuple[int, int] = (40, 34)
+    geometry_ocr_timeout: float = 20.0
     status_timeout: float = 8.0
     prepare_timeout: float = 60.0
     click_timeout: float = 20.0
@@ -300,8 +332,13 @@ class ExecutorConfig:
 
     @property
     def effective_allow_publish(self) -> bool:
-        """只有显式 --allow-publish 且 mode=APPROVAL_REQUIRED 才允许点击发表。"""
-        return bool(self.allow_publish) and self.mode == PUBLISH_MODE_APPROVAL_REQUIRED
+        """只有显式 --allow-publish 且 mode 为 APPROVAL_REQUIRED 或 POLICY_AUTONOMOUS 才允许点击发表。"""
+        return bool(self.allow_publish) and self.mode in (PUBLISH_MODE_APPROVAL_REQUIRED, "POLICY_AUTONOMOUS")
+
+    @property
+    def effective_geometry_publish(self) -> bool:
+        """geometry 发布权限：在通用发布权限之上再要求 --geometry-allow-publish。"""
+        return self.effective_allow_publish and bool(self.geometry_allow_publish)
 
     @property
     def bind_host(self) -> str:
@@ -364,6 +401,57 @@ class ExecutorConfig:
                 raise ConfigError("assumed_client_version 必须包含在 supported_versions 中，先完成人工验证")
             else:
                 self.assumed_client_version = assumed
+        driver = (self.driver or "uia").strip().lower()
+        if driver not in DRIVERS:
+            raise ConfigError(f"driver 必须是 uia 或 geometry，收到 {self.driver!r}")
+        self.driver = driver
+        if not isinstance(self.geometry_allow_publish, bool):
+            raise ConfigError("geometry_allow_publish 必须是布尔值")
+        if not isinstance(self.geometry_normalize_window, bool):
+            raise ConfigError("geometry_normalize_window 必须是布尔值")
+        if not isinstance(self.geometry_require_admin, bool):
+            raise ConfigError("geometry_require_admin 必须是布尔值")
+        if self.ocr_python is not None:
+            ocr_python = str(self.ocr_python).strip()
+            if not ocr_python:
+                self.ocr_python = None
+            else:
+                _validate_path_string(ocr_python, "ocr_python")
+                self.ocr_python = ocr_python
+        if not isinstance(self.max_publish_click_retries, int) or isinstance(self.max_publish_click_retries, bool):
+            raise ConfigError("max_publish_click_retries 必须是整数")
+        if not (0 <= self.max_publish_click_retries <= 2):
+            raise ConfigError("max_publish_click_retries 必须在 0 到 2 之间")
+        if not isinstance(self.retry_backoff_seconds, (int, float)) or isinstance(self.retry_backoff_seconds, bool):
+            raise ConfigError("retry_backoff_seconds 必须是数字")
+        if not (0.0 <= float(self.retry_backoff_seconds) <= 60.0):
+            raise ConfigError("retry_backoff_seconds 必须在 0 到 60 秒之间")
+        self.retry_backoff_seconds = float(self.retry_backoff_seconds)
+        if not isinstance(self.max_prepare_attempts, int) or isinstance(self.max_prepare_attempts, bool):
+            raise ConfigError("max_prepare_attempts 必须是整数")
+        if not (1 <= self.max_prepare_attempts <= 3):
+            raise ConfigError("max_prepare_attempts 必须在 1 到 3 之间")
+        if not isinstance(self.geometry_long_press_ms, int) or isinstance(self.geometry_long_press_ms, bool):
+            raise ConfigError("geometry_long_press_ms 必须是整数")
+        if not (900 <= self.geometry_long_press_ms <= 5000):
+            raise ConfigError("geometry_long_press_ms 必须在 900 到 5000 毫秒之间")
+        if not isinstance(self.geometry_wait_after_click, (int, float)) or isinstance(self.geometry_wait_after_click, bool):
+            raise ConfigError("geometry_wait_after_click 必须是数字")
+        if not (0.2 <= float(self.geometry_wait_after_click) <= 30.0):
+            raise ConfigError("geometry_wait_after_click 必须在 0.2 到 30 秒之间")
+        self.geometry_wait_after_click = float(self.geometry_wait_after_click)
+        offset = self.geometry_paste_fallback_offset
+        if not isinstance(offset, (tuple, list)) or len(offset) != 2:
+            raise ConfigError("geometry_paste_fallback_offset 必须是 [x, y] 两个整数")
+        offset_x, offset_y = offset
+        if any(not isinstance(item, int) or isinstance(item, bool) or not (0 <= item <= 500) for item in (offset_x, offset_y)):
+            raise ConfigError("geometry_paste_fallback_offset 的坐标必须是 0 到 500 的整数")
+        self.geometry_paste_fallback_offset = (int(offset_x), int(offset_y))
+        if not isinstance(self.geometry_ocr_timeout, (int, float)) or isinstance(self.geometry_ocr_timeout, bool):
+            raise ConfigError("geometry_ocr_timeout 必须是数字")
+        if not (1.0 <= float(self.geometry_ocr_timeout) <= 120.0):
+            raise ConfigError("geometry_ocr_timeout 必须在 1 到 120 秒之间")
+        self.geometry_ocr_timeout = float(self.geometry_ocr_timeout)
         for name, value in (
             ("status_timeout", self.status_timeout),
             ("prepare_timeout", self.prepare_timeout),
@@ -572,6 +660,7 @@ def _current_user_principal() -> str | None:
             ["whoami"],
             capture_output=True,
             text=True,
+            encoding=locale.getencoding(), errors="replace",
             timeout=5,
             check=False,
         )
@@ -604,6 +693,7 @@ def restrict_file_permissions(path: str, *, logger: logging.Logger | None = None
             ["icacls", path, "/inheritance:r", "/grant:r", f"{principal}:F"],
             capture_output=True,
             text=True,
+            encoding=locale.getencoding(), errors="replace",
             timeout=10,
             check=False,
         )
@@ -707,6 +797,17 @@ def describe_config(config: ExecutorConfig) -> dict[str, Any]:
         "trustedAccountSource": config.trusted_account_source,
         "assumedClientVersion": config.assumed_client_version,
         "supportedVersions": list(config.supported_versions),
+        "driver": config.driver,
+        "geometryAllowPublish": config.geometry_allow_publish,
+        "geometryNormalizeWindow":config.geometry_normalize_window,
+        "geometryRequireAdmin": config.geometry_require_admin,
+        "standardWindowSize": [1200, 900],
+        "windowNormalizeMode": "physical-pixels",
+        "pasteFallbackOffset": list(config.geometry_paste_fallback_offset),
+        "effectiveGeometryPublish": config.effective_geometry_publish,
+        "ocrPythonConfigured": bool(config.ocr_python),
+        "maxPublishClickRetries": config.max_publish_click_retries,
+        "retryBackoffSeconds": config.retry_backoff_seconds,
         "uiaDependency": "未检测（由驱动在运行时惰性导入）",
     }
 
@@ -783,6 +884,30 @@ _FLAT_KEY_ALIASES = {
     "wechat_window_titles": "wechat_window_titles",
     "wechatwindowclasses": "wechat_window_classes",
     "wechat_window_classes": "wechat_window_classes",
+    # 微信 4.x 几何驱动（opt-in）
+    "driver": "driver",
+    "geometryallowpublish": "geometry_allow_publish",
+    "geometry_allow_publish": "geometry_allow_publish",
+    "geometrynormalizewindow": "geometry_normalize_window",
+    "geometry_normalize_window": "geometry_normalize_window",
+    "geometryrequireadmin": "geometry_require_admin",
+    "geometry_require_admin": "geometry_require_admin",
+    "ocrpython": "ocr_python",
+    "ocr_python": "ocr_python",
+    "maxpublishclickretries": "max_publish_click_retries",
+    "max_publish_click_retries": "max_publish_click_retries",
+    "retrybackoffseconds": "retry_backoff_seconds",
+    "retry_backoff_seconds": "retry_backoff_seconds",
+    "maxprepareattempts": "max_prepare_attempts",
+    "max_prepare_attempts": "max_prepare_attempts",
+    "geometrylongpressms": "geometry_long_press_ms",
+    "geometry_long_press_ms": "geometry_long_press_ms",
+    "geometrywaitafterclick": "geometry_wait_after_click",
+    "geometry_wait_after_click": "geometry_wait_after_click",
+    "geometrypastefallbackoffset": "geometry_paste_fallback_offset",
+    "geometry_paste_fallback_offset": "geometry_paste_fallback_offset",
+    "geometryocrtimeout": "geometry_ocr_timeout",
+    "geometry_ocr_timeout": "geometry_ocr_timeout",
 }
 
 
@@ -868,8 +993,24 @@ def _config_from_flat(raw: Mapping[str, Any], base: str) -> ExecutorConfig:
             values[alias] = _as_str(value, key).upper()
         elif alias == "allow_publish":
             values[alias] = _as_bool(value, key)
-        elif alias in ("token_file", "log_file", "screenshot_dir", "expected_account_id", "trusted_account_source", "assumed_client_version"):
+        elif alias in ("token_file", "log_file", "screenshot_dir", "expected_account_id", "trusted_account_source", "assumed_client_version", "ocr_python"):
             values[alias] = _as_str(value, key)
+        elif alias == "driver":
+            values[alias] = _as_str(value, key).lower()
+        elif alias in ("geometry_allow_publish", "geometry_normalize_window", "geometry_require_admin"):
+            values[alias] = _as_bool(value, key)
+        elif alias in ("max_publish_click_retries", "max_prepare_attempts", "geometry_long_press_ms"):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ConfigError(f"配置项 {key} 必须是整数")
+            values[alias] = value
+        elif alias in ("retry_backoff_seconds", "geometry_wait_after_click"):
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise ConfigError(f"配置项 {key} 必须是数字")
+            values[alias] = float(value)
+        elif alias == "geometry_paste_fallback_offset":
+            if not isinstance(value, (list, tuple)) or len(value) != 2:
+                raise ConfigError(f"配置项 {key} 必须是 [x, y] 两个整数")
+            values[alias] = (int(value[0]), int(value[1]))
         elif alias in ("asset_roots", "supported_versions", "wechat_exe_names", "wechat_window_titles", "wechat_window_classes"):
             values[alias] = _as_str_list(value, key)
         elif alias in ("max_text_length", "max_images"):
@@ -958,6 +1099,43 @@ def _config_from_nested_moments(raw: Mapping[str, Any], base: str) -> ExecutorCo
         values["assumed_client_version"] = _as_str(
             desktop["assumedClientVersion"], "desktopExecutor.assumedClientVersion"
         )
+    if desktop.get("driver") is not None:
+        values["driver"] = _as_str(desktop["driver"], "desktopExecutor.driver").lower()
+    if desktop.get("geometryAllowPublish") is not None:
+        values["geometry_allow_publish"] = _as_bool(
+            desktop["geometryAllowPublish"], "desktopExecutor.geometryAllowPublish"
+        )
+    if desktop.get("ocrPython") is not None:
+        values["ocr_python"] = _as_str(desktop["ocrPython"], "desktopExecutor.ocrPython")
+    if desktop.get("geometryNormalizeWindow") is not None:
+        values['geometry_normalize_window'] = _as_bool(desktop['geometryNormalizeWindow'],'desktopExecutor.geometryNormalizeWindow')
+    if desktop.get("geometryRequireAdmin") is not None:
+        values["geometry_require_admin"] = _as_bool(
+            desktop["geometryRequireAdmin"], "desktopExecutor.geometryRequireAdmin"
+        )
+    for source_key, target_key in (
+        ("maxPublishClickRetries", "max_publish_click_retries"),
+        ("maxPrepareAttempts", "max_prepare_attempts"),
+        ("geometryLongPressMs", "geometry_long_press_ms"),
+    ):
+        if desktop.get(source_key) is not None:
+            if not isinstance(desktop[source_key], int) or isinstance(desktop[source_key], bool):
+                raise ConfigError(f"desktopExecutor.{source_key} 必须是整数")
+            values[target_key] = desktop[source_key]
+    for source_key, target_key in (
+        ("retryBackoffSeconds", "retry_backoff_seconds"),
+        ("geometryWaitAfterClick", "geometry_wait_after_click"),
+        ("geometryOcrTimeout", "geometry_ocr_timeout"),
+    ):
+        if desktop.get(source_key) is not None:
+            if not isinstance(desktop[source_key], (int, float)) or isinstance(desktop[source_key], bool):
+                raise ConfigError(f"desktopExecutor.{source_key} 必须是数字")
+            values[target_key] = float(desktop[source_key])
+    if desktop.get("geometryPasteFallbackOffset") is not None:
+        offset = desktop["geometryPasteFallbackOffset"]
+        if not isinstance(offset, (list, tuple)) or len(offset) != 2:
+            raise ConfigError("desktopExecutor.geometryPasteFallbackOffset 必须是 [x, y] 两个整数")
+        values["geometry_paste_fallback_offset"] = (int(offset[0]), int(offset[1]))
     if policy.get("maxTextLength") is not None:
         if not isinstance(policy["maxTextLength"], int):
             raise ConfigError("policy.maxTextLength 必须是整数")

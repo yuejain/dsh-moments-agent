@@ -28,7 +28,7 @@ import time
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 PNG_MIME = "image/png"
 
@@ -363,6 +363,104 @@ def sample_history() -> dict[str, Any]:
     }
 
 
+def sample_chat_memory(enabled: bool = True) -> dict[str, Any]:
+    """社交记忆示例数据（全部为占位符：示例群 / 联系人A / 群友A）。
+
+    enabled=False 时模拟默认关闭：没有会话与统计，只有默认设置。
+    """
+    settings: dict[str, Any] = {
+        "enabled": enabled,
+        "includePrivate": False,
+        "conversations": [],
+        "syncIntervalMinutes": 60,
+        "maxMessagesPerConversation": 200,
+        "retentionDays": 30,
+        "impressionTtlDays": 90,
+        "maxMembersPerConversation": 100,
+        "anonymizeInPrompts": True,
+        "useLlmExtraction": True,
+    }
+    if not enabled:
+        return {
+            "enabled": False,
+            "settings": settings,
+            "stats": {"conversations": 0, "messages": 0, "members": 0, "lastSyncedAt": None},
+            "conversations": [],
+        }
+
+    conversations: list[dict[str, Any]] = [
+        {
+            "conversation": {
+                "conversationKey": "conv_demo_group_0001",
+                "kind": "group",
+                "label": "群聊A",
+                "displayName": "示例群",
+                "enabled": True,
+                "lastSyncedAt": "2026-10-25T08:00:00.000Z",
+                "lastMessageAt": "2026-10-25T07:42:00.000Z",
+                "createdAt": "2026-10-20T09:10:00.000Z",
+                "updatedAt": "2026-10-25T08:00:00.000Z",
+            },
+            "members": [
+                {
+                    "impressionId": "imp_demo_group_0001",
+                    "alias": "群友A",
+                    "displayName": "联系人A",
+                    "summary": "常聊周末活动和附近的小店，表达直接、爱开玩笑。",
+                    "traits": ["爱玩梗", "表达直接"],
+                    "topics": ["周末计划", "美食"],
+                    "style": "短句、语气轻松",
+                    "confidence": 0.72,
+                    "evidenceCount": 5,
+                    "status": "observed",
+                    "source": "auto",
+                    "firstSeenAt": "2026-10-21T10:00:00.000Z",
+                    "lastSeenAt": "2026-10-25T07:42:00.000Z",
+                    "updatedAt": "2026-10-25T08:00:00.000Z",
+                    "expiresAt": "2027-01-23T08:00:00.000Z",
+                },
+                {
+                    "impressionId": "imp_demo_group_0002",
+                    "alias": "群友B",
+                    "displayName": "联系人B",
+                    "summary": "经常分享工具和长文，讨论时认真、乐于补充细节。",
+                    "traits": ["乐于分享", "认真讨论"],
+                    "topics": ["效率工具"],
+                    "style": "偏长句，喜欢补充背景",
+                    "confidence": 0.41,
+                    "evidenceCount": 2,
+                    "status": "new",
+                    "source": "auto",
+                    "firstSeenAt": "2026-10-24T12:00:00.000Z",
+                    "lastSeenAt": "2026-10-25T07:40:00.000Z",
+                    "updatedAt": "2026-10-25T08:00:00.000Z",
+                    "expiresAt": "2027-01-23T08:00:00.000Z",
+                },
+            ],
+        },
+        {
+            "conversation": {
+                "conversationKey": "conv_demo_private_0001",
+                "kind": "private",
+                "label": "私聊A",
+                "displayName": "联系人A",
+                "enabled": False,
+                "lastSyncedAt": None,
+                "lastMessageAt": "2026-10-24T22:10:00.000Z",
+                "createdAt": "2026-10-20T09:12:00.000Z",
+                "updatedAt": "2026-10-24T22:10:00.000Z",
+            },
+            "members": [],
+        },
+    ]
+    return {
+        "enabled": True,
+        "settings": settings,
+        "stats": {"conversations": 2, "messages": 24, "members": 2, "lastSyncedAt": "2026-10-25T08:00:00.000Z"},
+        "conversations": conversations,
+    }
+
+
 def sample_persona() -> dict[str, Any]:
     return {
         "soul": (
@@ -471,6 +569,14 @@ class FakeAdminServer:
         self.business_error: dict[str, Any] | None = None
         self.raw_next: tuple[int, bytes, str] | None = None
         self.delay_seconds = 0.0
+        # 社交记忆：默认模拟已在插件配置中开启（可被测试改为 False 验证默认关闭态）；
+        # settings 覆盖与成员/会话删除只保存在本进程内，供界面交互演示使用。
+        self.chat_memory_enabled = True
+        self.chat_ever_enabled = False
+        self.chat_memory_settings: dict[str, Any] | None = None
+        self.chat_member_overrides: dict[str, dict[str, Any]] = {}
+        self.chat_deleted_members: set[str] = set()
+        self.chat_deleted_conversations: set[str] = set()
         self._httpd = _FakeHTTPServer(("127.0.0.1", 0), _FakeHandler)
         self._httpd.fake_state = self
         self._thread: threading.Thread | None = None
@@ -525,6 +631,45 @@ class FakeAdminServer:
             raw = self.raw_next
             self.raw_next = None
         return status, business, raw
+
+    # -- 社交记忆（可交互演示） ----------------------------------------
+    def chat_memory_view(self) -> dict[str, Any]:
+        """当前社交记忆视图：应用设置覆盖、人物修正与删除后的状态。
+
+        与真实管理 API 一致：关闭总开关后仍返回本地已保存数据（从未同步过则为空），
+        便于所有者查看与清除；修正人物印象需要先开启。
+        """
+        base_has_data = self.chat_memory_enabled or self.chat_ever_enabled
+        data = sample_chat_memory(base_has_data)
+        settings = data["settings"]
+        if self.chat_memory_settings:
+            settings.update(self.chat_memory_settings)
+        enabled = bool(settings.get("enabled"))
+        data["enabled"] = enabled
+        if enabled:
+            self.chat_ever_enabled = True
+        if not (enabled or self.chat_ever_enabled):
+            data["conversations"] = []
+            data["stats"] = {"conversations": 0, "messages": 0, "members": 0, "lastSyncedAt": None}
+            return data
+        conversations: list[dict[str, Any]] = []
+        for item in data["conversations"]:
+            if item["conversation"]["conversationKey"] in self.chat_deleted_conversations:
+                continue
+            members = [
+                {**member, **self.chat_member_overrides.get(member["impressionId"], {})}
+                for member in item["members"]
+                if member["impressionId"] not in self.chat_deleted_members
+            ]
+            conversations.append({**item, "members": members})
+        data["conversations"] = conversations
+        data["stats"] = {
+            "conversations": len(conversations),
+            "messages": max(0, 24 - 12 * len(self.chat_deleted_conversations)),
+            "members": sum(len(item["members"]) for item in conversations),
+            "lastSyncedAt": data["stats"]["lastSyncedAt"],
+        }
+        return data
 
 
 class _FakeHTTPServer(ThreadingHTTPServer):
@@ -609,8 +754,20 @@ class _FakeHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
 
+    def do_PATCH(self) -> None:  # noqa: N802
+        try:
+            self._dispatch("PATCH")
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        try:
+            self._dispatch("DELETE")
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+
     def _dispatch(self, method: str) -> None:
-        body_raw = self._read_body() if method == "POST" else b""
+        body_raw = self._read_body() if method in ("POST", "PATCH") else b""
         body = self._record(method, body_raw)
         self._maybe_delay()
 
@@ -796,6 +953,91 @@ class _FakeHandler(BaseHTTPRequestHandler):
                         "task": {**sample_task(), "state": "PUBLISHED"},
                     },
                 },
+            )
+            return
+
+        # -- 社交记忆（chat-memory）------------------------------------
+        if method == "GET" and path == "/api/chat-memory":
+            self._send_json(200, {"ok": True, "data": self.fake.chat_memory_view()})
+            return
+        if method == "POST" and path == "/api/chat-memory/settings":
+            if not isinstance(body, dict) or not body:
+                self._send_json(400, {"ok": False, "message": "设置必须是 JSON 对象"})
+                return
+            merged = dict(self.fake.chat_memory_settings or {})
+            merged.update(body)
+            self.fake.chat_memory_settings = merged
+            self.fake.chat_memory_enabled = bool(merged.get("enabled", self.fake.chat_memory_enabled))
+            view = self.fake.chat_memory_view()
+            self._send_json(200, {"ok": True, "data": view["settings"]})
+            return
+        if method == "POST" and path == "/api/chat-memory/sync":
+            if not self.fake.chat_memory_enabled:
+                self._send_json(
+                    200,
+                    {"ok": False, "message": "社交记忆未开启（chatMemory.enabled=false）", "errorCode": "CHAT_MEMORY_DISABLED"},
+                )
+                return
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "data": {
+                        "conversations": 2,
+                        "newMessages": 6,
+                        "impressionsUpdated": 2,
+                        "skipped": [{"label": "私聊A", "reason": "includePrivate=false，已跳过私聊"}],
+                        "errors": [],
+                    },
+                },
+            )
+            return
+        if method == "PATCH" and path.startswith("/api/chat-memory/members/"):
+            if not self.fake.chat_memory_view()["enabled"]:
+                self._send_json(
+                    200,
+                    {"ok": False, "message": "社交记忆未启用（chatMemory.enabled=false）", "errorCode": "CHAT_MEMORY_DISABLED"},
+                )
+                return
+            impression_id = unquote(path.rsplit("/", 1)[-1])
+            view = self.fake.chat_memory_view()
+            member = next(
+                (item for conversation in view["conversations"] for item in conversation["members"]
+                 if item["impressionId"] == impression_id),
+                None,
+            )
+            if member is None:
+                self._send_json(404, {"ok": False, "message": "人物印象不存在", "errorCode": "CHAT_MEMBER_NOT_FOUND"})
+                return
+            override = dict(self.fake.chat_member_overrides.get(impression_id, {}))
+            if isinstance(body, dict):
+                for key in ("alias", "summary", "traits", "topics", "style"):
+                    if key in body:
+                        override[key] = body[key]
+                override["status"] = body.get("status") if isinstance(body.get("status"), str) else "owner_edited"
+                override["source"] = "owner"
+            self.fake.chat_member_overrides[impression_id] = override
+            member.update(override)
+            self._send_json(200, {"ok": True, "data": member})
+            return
+        if method == "DELETE" and path.startswith("/api/chat-memory/members/"):
+            impression_id = unquote(path.rsplit("/", 1)[-1])
+            self.fake.chat_deleted_members.add(impression_id)
+            self._send_json(200, {"ok": True, "data": {"impressionId": impression_id, "deleted": True}})
+            return
+        if method == "DELETE" and path.startswith("/api/chat-memory/conversations/"):
+            conversation_key = unquote(path.rsplit("/", 1)[-1])
+            view = self.fake.chat_memory_view()
+            target = next(
+                (item for item in view["conversations"]
+                 if item["conversation"]["conversationKey"] == conversation_key),
+                None,
+            )
+            members = len(target["members"]) if target else 0
+            self.fake.chat_deleted_conversations.add(conversation_key)
+            self._send_json(
+                200,
+                {"ok": True, "data": {"conversationKey": conversation_key, "messages": 12, "members": members}},
             )
             return
 

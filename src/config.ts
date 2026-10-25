@@ -48,6 +48,31 @@ export interface ImagesConfig {
   assetDir: string;
 }
 
+/**
+ * 拟人化自动发送配置。
+ *
+ * 默认关闭：只有 owner 显式写 `policy.humanize.enabled=true`，且发布模式为
+ * APPROVAL_REQUIRED（或部署级显式放开的 POLICY_AUTONOMOUS）时才会生效。
+ * 该能力只处理“已批准且审批仍有效”的内容：不会自动批准、不会绕过内容哈希、
+ * 不会重试 UNCERTAIN，也不会改变账号/可见范围。
+ */
+export interface HumanizeConfig {
+  /** 拟人化自动发送总开关；默认 false。 */
+  enabled: boolean;
+  /** 发布延迟随机区间（秒）：从“可发送”到真正执行之间的等待。 */
+  delaySeconds: readonly [number, number];
+  /** 活跃时段（配置时区本地 HH:mm，左闭右开）；时段外绝不自动发送。 */
+  activeHours: readonly [string, string];
+  /** 与上一条已发布内容的最小间隔（秒）；实际生效值取它与 policy.minIntervalMinutes 的较大者。 */
+  minIntervalSeconds: number;
+  /** 间隔/延迟的随机抖动上限（秒），用确定性抖动避免重启后重复随机。 */
+  jitterSeconds: number;
+  /** 单条内容最多自动尝试次数（含准备失败）；达到后转人工，不再重复点击。 */
+  maxPublishAttempts: number;
+  /** 失败重试的指数退避区间（秒）：base*2^(n-1)，且不超过上限。 */
+  backoffSeconds: readonly [number, number];
+}
+
 export interface PolicyConfig {
   dailyLimit: number;
   minIntervalMinutes: number;
@@ -58,6 +83,7 @@ export interface PolicyConfig {
   timeZone: string;
   maxTextLength: number;
   maxImages: number;
+  humanize: HumanizeConfig;
 }
 
 export interface SchedulerConfig {
@@ -77,6 +103,26 @@ export interface WorkspaceConfig {
   visualStyleFile: string;
 }
 
+/**
+ * 社交记忆：只读 WeChatAgent 白名单内的群聊/私聊，提炼人物印象供朋友圈弱参考。
+ *
+ * 默认关闭。开启后依然只使用上游已经允许的会话；私聊需要单独显式开启。
+ * 提示词只使用别名（群友A / 对方），真实昵称只存本地并只在管理页展示。
+ */
+export interface ChatMemoryConfig {
+  enabled: boolean;
+  includePrivate: boolean;
+  /** 会话名或 conversationKey；空数组表示上游白名单内的全部会话。 */
+  conversations: string[];
+  syncIntervalMinutes: number;
+  maxMessagesPerConversation: number;
+  retentionDays: number;
+  impressionTtlDays: number;
+  maxMembersPerConversation: number;
+  anonymizeInPrompts: boolean;
+  useLlmExtraction: boolean;
+}
+
 export interface MomentsConfig {
   enabled: boolean;
   dataDir: string;
@@ -92,6 +138,7 @@ export interface MomentsConfig {
   scheduler: SchedulerConfig;
   adminServer: AdminServerConfig;
   workspace: WorkspaceConfig;
+  chatMemory: ChatMemoryConfig;
   /** 未识别的配置字段原样保留，便于向前兼容与诊断。 */
   readonly extra: Readonly<Record<string, unknown>>;
 }
@@ -148,10 +195,31 @@ const DEFAULTS = {
     timeZone: 'Asia/Shanghai',
     maxTextLength: 2000,
     maxImages: 9,
+    humanize: {
+      enabled: false,
+      delaySeconds: [90, 900] as const,
+      activeHours: ['09:00', '22:00'] as const,
+      minIntervalSeconds: 3600,
+      jitterSeconds: 600,
+      maxPublishAttempts: 2,
+      backoffSeconds: [60, 180] as const,
+    },
   },
   scheduler: { tickSeconds: 60, ideaProbability: 0.05, jitterSeconds: 0 },
   adminServer: { enabled: false, port: 18766, tokenFile: null },
   workspace: { personaFile: 'persona/SOUL.md', visualStyleFile: 'persona/VISUAL_STYLE.md' },
+  chatMemory: {
+    enabled: false,
+    includePrivate: false,
+    conversations: [] as string[],
+    syncIntervalMinutes: 60,
+    maxMessagesPerConversation: 200,
+    retentionDays: 30,
+    impressionTtlDays: 90,
+    maxMembersPerConversation: 100,
+    anonymizeInPrompts: true,
+    useLlmExtraction: true,
+  },
 };
 
 const KNOWN_KEYS = new Set(Object.keys(DEFAULTS));
@@ -178,6 +246,34 @@ function num(value: unknown, fallback: number, path: string, min: number, max: n
   if (typeof value !== 'number' || !Number.isFinite(value)) throw invalid(`${path} 必须是数字`);
   if (value < min || value > max) throw invalid(`${path} 必须在 ${min} 到 ${max} 之间`);
   return value;
+}
+
+function int(value: unknown, fallback: number, path: string, min: number, max: number): number {
+  const parsed = num(value, fallback, path, min, max);
+  if (!Number.isInteger(parsed)) throw invalid(`${path} 必须是整数`);
+  return parsed;
+}
+
+function secondsPair(
+  value: unknown,
+  fallback: readonly [number, number],
+  path: string,
+  min: number,
+  max: number,
+): readonly [number, number] {
+  if (value === undefined) return fallback;
+  if (!Array.isArray(value) || value.length !== 2) {
+    throw invalid(`${path} 必须是 [最小秒数, 最大秒数] 两个整数`);
+  }
+  const low = int(value[0], fallback[0], `${path}[0]`, min, max);
+  const high = int(value[1], fallback[1], `${path}[1]`, min, max);
+  if (low > high) throw invalid(`${path}[0] 不能大于 ${path}[1]`);
+  return [low, high];
+}
+
+/** 兼容 snake_case 与 camelCase：现有配置风格是 camelCase，但允许 owner 直接粘贴示例。 */
+function field(record: Record<string, unknown>, camel: string, snake: string): unknown {
+  return record[camel] !== undefined ? record[camel] : record[snake];
 }
 
 function text(
@@ -221,6 +317,20 @@ function timeOfDay(value: unknown, fallback: string, path: string): string {
   return raw;
 }
 
+/** 活跃时段区间：起止不能相同（避免“全天活跃”被误配置）。 */
+function hoursPair(value: unknown, fallback: readonly [string, string], path: string): readonly [string, string] {
+  if (value === undefined) return fallback;
+  if (!Array.isArray(value) || value.length !== 2) {
+    throw invalid(`${path} 必须是 [开始 HH:mm, 结束 HH:mm] 两个字符串`);
+  }
+  const start = timeOfDay(value[0], fallback[0], `${path}[0]`);
+  const end = timeOfDay(value[1], fallback[1], `${path}[1]`);
+  if (start === end) {
+    throw invalid(`${path} 起止时间不能相同；如需全天活跃请配置 00:00–23:59`);
+  }
+  return [start, end];
+}
+
 function enumValue<T extends string>(value: unknown, fallback: T, path: string, allowed: readonly T[]): T {
   if (value === undefined) return fallback;
   if (typeof value !== 'string' || !(allowed as readonly string[]).includes(value)) {
@@ -240,9 +350,11 @@ export function parseConfig(raw: unknown): MomentsConfig {
   const desktop = asRecord(root.desktopExecutor ?? {}, 'config.desktopExecutor');
   const images = asRecord(root.images ?? {}, 'config.images');
   const policy = asRecord(root.policy ?? {}, 'config.policy');
+  const humanize = asRecord(policy.humanize ?? {}, 'config.policy.humanize');
   const scheduler = asRecord(root.scheduler ?? {}, 'config.scheduler');
   const admin = asRecord(root.adminServer ?? {}, 'config.adminServer');
   const workspace = asRecord(root.workspace ?? {}, 'config.workspace');
+  const chatMemory = asRecord(field(root, 'chatMemory', 'chat_memory') ?? {}, 'config.chatMemory');
 
   const quietHoursRaw = policy.quietHours;
   let quietHours: readonly [string, string] = DEFAULTS.policy.quietHours;
@@ -285,6 +397,22 @@ export function parseConfig(raw: unknown): MomentsConfig {
   const extra: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(root)) {
     if (!KNOWN_KEYS.has(key)) extra[key] = value;
+  }
+
+  const conversationsRaw = field(chatMemory, 'conversations', 'conversations');
+  let chatConversations = [...DEFAULTS.chatMemory.conversations];
+  if (conversationsRaw !== undefined) {
+    if (!Array.isArray(conversationsRaw)) {
+      throw invalid('config.chatMemory.conversations 必须是字符串数组');
+    }
+    if (conversationsRaw.length > 50) throw invalid('config.chatMemory.conversations 最多 50 项');
+    chatConversations = conversationsRaw.map((item, index) => {
+      if (typeof item !== 'string' || item.trim() === '') {
+        throw invalid(`config.chatMemory.conversations[${index}] 必须是非空字符串`);
+      }
+      if (item.trim().length > 120) throw invalid(`config.chatMemory.conversations[${index}] 过长（最多 120 字符）`);
+      return item.trim();
+    });
   }
 
   const config: MomentsConfig = {
@@ -390,6 +518,49 @@ export function parseConfig(raw: unknown): MomentsConfig {
       timeZone: text(policy.timeZone, DEFAULTS.policy.timeZone, 'config.policy.timeZone', { maxLength: 80 }),
       maxTextLength: num(policy.maxTextLength, DEFAULTS.policy.maxTextLength, 'config.policy.maxTextLength', 50, 5000),
       maxImages: num(policy.maxImages, DEFAULTS.policy.maxImages, 'config.policy.maxImages', 0, 9),
+      humanize: {
+        enabled: bool(field(humanize, 'enabled', 'enabled'), DEFAULTS.policy.humanize.enabled, 'config.policy.humanize.enabled'),
+        delaySeconds: secondsPair(
+          field(humanize, 'delaySeconds', 'delay_seconds'),
+          DEFAULTS.policy.humanize.delaySeconds,
+          'config.policy.humanize.delaySeconds',
+          0,
+          3600,
+        ),
+        activeHours: hoursPair(
+          field(humanize, 'activeHours', 'active_hours'),
+          DEFAULTS.policy.humanize.activeHours,
+          'config.policy.humanize.activeHours',
+        ),
+        minIntervalSeconds: int(
+          field(humanize, 'minIntervalSeconds', 'min_interval_seconds'),
+          DEFAULTS.policy.humanize.minIntervalSeconds,
+          'config.policy.humanize.minIntervalSeconds',
+          0,
+          7 * 24 * 3600,
+        ),
+        jitterSeconds: int(
+          field(humanize, 'jitterSeconds', 'jitter_seconds'),
+          DEFAULTS.policy.humanize.jitterSeconds,
+          'config.policy.humanize.jitterSeconds',
+          0,
+          3600,
+        ),
+        maxPublishAttempts: int(
+          field(humanize, 'maxPublishAttempts', 'max_publish_attempts'),
+          DEFAULTS.policy.humanize.maxPublishAttempts,
+          'config.policy.humanize.maxPublishAttempts',
+          1,
+          5,
+        ),
+        backoffSeconds: secondsPair(
+          field(humanize, 'backoffSeconds', 'backoff_seconds'),
+          DEFAULTS.policy.humanize.backoffSeconds,
+          'config.policy.humanize.backoffSeconds',
+          0,
+          86400,
+        ),
+      },
     },
     scheduler: {
       tickSeconds: num(scheduler.tickSeconds, DEFAULTS.scheduler.tickSeconds, 'config.scheduler.tickSeconds', 15, 3600),
@@ -416,16 +587,67 @@ export function parseConfig(raw: unknown): MomentsConfig {
         { maxLength: 260 },
       ),
     },
+    chatMemory: {
+      enabled: bool(field(chatMemory, 'enabled', 'enabled'), DEFAULTS.chatMemory.enabled, 'config.chatMemory.enabled'),
+      includePrivate: bool(
+        field(chatMemory, 'includePrivate', 'include_private'),
+        DEFAULTS.chatMemory.includePrivate,
+        'config.chatMemory.includePrivate',
+      ),
+      conversations: chatConversations,
+      syncIntervalMinutes: int(
+        field(chatMemory, 'syncIntervalMinutes', 'sync_interval_minutes'),
+        DEFAULTS.chatMemory.syncIntervalMinutes,
+        'config.chatMemory.syncIntervalMinutes',
+        5,
+        24 * 60,
+      ),
+      maxMessagesPerConversation: int(
+        field(chatMemory, 'maxMessagesPerConversation', 'max_messages_per_conversation'),
+        DEFAULTS.chatMemory.maxMessagesPerConversation,
+        'config.chatMemory.maxMessagesPerConversation',
+        10,
+        500,
+      ),
+      retentionDays: int(
+        field(chatMemory, 'retentionDays', 'retention_days'),
+        DEFAULTS.chatMemory.retentionDays,
+        'config.chatMemory.retentionDays',
+        1,
+        180,
+      ),
+      impressionTtlDays: int(
+        field(chatMemory, 'impressionTtlDays', 'impression_ttl_days'),
+        DEFAULTS.chatMemory.impressionTtlDays,
+        'config.chatMemory.impressionTtlDays',
+        7,
+        365,
+      ),
+      maxMembersPerConversation: int(
+        field(chatMemory, 'maxMembersPerConversation', 'max_members_per_conversation'),
+        DEFAULTS.chatMemory.maxMembersPerConversation,
+        'config.chatMemory.maxMembersPerConversation',
+        5,
+        500,
+      ),
+      anonymizeInPrompts: bool(
+        field(chatMemory, 'anonymizeInPrompts', 'anonymize_in_prompts'),
+        DEFAULTS.chatMemory.anonymizeInPrompts,
+        'config.chatMemory.anonymizeInPrompts',
+      ),
+      useLlmExtraction: bool(
+        field(chatMemory, 'useLlmExtraction', 'use_llm_extraction'),
+        DEFAULTS.chatMemory.useLlmExtraction,
+        'config.chatMemory.useLlmExtraction',
+      ),
+    },
     extra,
   };
 
   if (config.policy.requireApproval === false && config.publishMode === 'APPROVAL_REQUIRED') {
     throw invalid('config.policy.requireApproval=false 与 publishMode=APPROVAL_REQUIRED 冲突');
   }
-  if (config.publishMode === 'POLICY_AUTONOMOUS') {
-    // 允许配置，但默认执行器会再次拒绝；此处只做显式提示性校验。
-    // 说明：不因为配置里写了 POLICY_AUTONOMOUS 就认为平台规则允许自动发布。
-  }
+  if (config.publishMode === 'POLICY_AUTONOMOUS') config.policy.requireApproval = false;
 
   return config;
 }
@@ -453,6 +675,16 @@ export function describeConfig(config: MomentsConfig): Record<string, unknown> {
     },
     desktopExecutor: { enabled: config.desktopExecutor.enabled, baseUrl: config.desktopExecutor.baseUrl },
     images: { providers: config.images.providers, officialApiEnabled: config.images.officialApiEnabled },
+    chatMemory: {
+      enabled: config.chatMemory.enabled,
+      includePrivate: config.chatMemory.includePrivate,
+      conversations: config.chatMemory.conversations.length,
+      syncIntervalMinutes: config.chatMemory.syncIntervalMinutes,
+      retentionDays: config.chatMemory.retentionDays,
+      impressionTtlDays: config.chatMemory.impressionTtlDays,
+      anonymizeInPrompts: config.chatMemory.anonymizeInPrompts,
+      useLlmExtraction: config.chatMemory.useLlmExtraction,
+    },
     policy: {
       dailyLimit: config.policy.dailyLimit,
       minIntervalMinutes: config.policy.minIntervalMinutes,
@@ -461,6 +693,16 @@ export function describeConfig(config: MomentsConfig): Record<string, unknown> {
       approvalTtlMinutes: config.policy.approvalTtlMinutes,
       minScoreToPublish: config.policy.minScoreToPublish,
       timeZone: config.policy.timeZone,
+      humanize: {
+        enabled: config.policy.humanize.enabled,
+        delaySeconds: config.policy.humanize.delaySeconds,
+        activeHours: config.policy.humanize.activeHours,
+        minIntervalSeconds: config.policy.humanize.minIntervalSeconds,
+        jitterSeconds: config.policy.humanize.jitterSeconds,
+        maxPublishAttempts: config.policy.humanize.maxPublishAttempts,
+        backoffSeconds: config.policy.humanize.backoffSeconds,
+        dailyLimit: config.policy.dailyLimit,
+      },
     },
   };
 }

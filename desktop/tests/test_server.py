@@ -66,6 +66,7 @@ class HttpHarness:
         expected_account_id: str | None = None,
         max_images: int = 9,
         max_text_length: int = 2000,
+        config_overrides: Mapping[str, Any] | None = None,
     ) -> None:
         _silence_logs()
         self.root = pathlib.Path(tempfile.mkdtemp(prefix="dsh-desktop-test-"))
@@ -73,7 +74,7 @@ class HttpHarness:
         self.screenshot_dir.mkdir(parents=True, exist_ok=True)
         self.asset_root = self.root / "assets"
         self.asset_root.mkdir(parents=True, exist_ok=True)
-        self.config = ExecutorConfig(
+        config_kwargs: dict[str, Any] = dict(
             host="127.0.0.1",
             port=0,
             mode=mode,
@@ -92,6 +93,9 @@ class HttpHarness:
             verify_timeout=2.0,
             screenshot_timeout=2.0,
         )
+        if config_overrides:
+            config_kwargs.update(config_overrides)
+        self.config = ExecutorConfig(**config_kwargs)
         self.driver = driver if driver is not None else FakeWechatDriver()
         self.server, self.app = create_server(self.config, driver=self.driver, token=TOKEN)
         self.thread = threading.Thread(

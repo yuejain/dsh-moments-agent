@@ -106,6 +106,7 @@ export function mapDesktopErrorCode(code: string | null): MomentsErrorCode {
 export class Publisher {
   private readonly policy: PublishPolicy;
   private busy = false;
+  get isBusy(): boolean { return this.busy; }
 
   private async exclusive<T>(operation: () => Promise<T>): Promise<T> {
     if (this.busy) throw new MomentsError('CONFLICT', '桌面执行中，请等待当前操作结束');
@@ -214,14 +215,15 @@ export class Publisher {
         };
       }
     }
-    if (!['APPROVED', 'QUEUED'].includes(task.state)) {
+    const requiresApproval = this.config.publishMode === 'APPROVAL_REQUIRED';
+    if (!(requiresApproval ? ['APPROVED', 'QUEUED'] : ['READY_FOR_APPROVAL', 'READY_TO_PUBLISH', 'APPROVED', 'QUEUED']).includes(task.state)) {
       throw new MomentsError('CONFLICT', `任务状态 ${task.state} 不允许准备`, {
         details: { taskId, state: task.state },
       });
     }
     const snapshot = this.snapshotFor(task);
-    const approval = this.findApproval(taskId, null);
-    this.approvalService.validateOwner(approval, 'manual_admin', approval.ownerId);
+    const approval = requiresApproval ? this.findApproval(taskId, null) : null;
+    if (approval) this.approvalService.validateOwner(approval, 'manual_admin', approval.ownerId);
     const context = await this.policyContext(task, snapshot, approval);
     assertPublishDecision(this.policy.evaluatePrepare(context));
 
@@ -247,7 +249,7 @@ export class Publisher {
     const { attempt } = this.store.createAttempt({
       attemptId: newId('att'),
       taskId,
-      approvalId: approval.approvalId,
+      approvalId: approval?.approvalId ?? null,
       idempotencyKey,
       contentHash: snapshot.contentHash,
       assetManifestHash: snapshot.assetManifestHash,
@@ -257,7 +259,7 @@ export class Publisher {
     });
     this.store.updateAttempt(attempt.attemptId, { state: 'PREPARING' });
 
-    if (task.state === 'APPROVED') {
+    if (task.state !== 'QUEUED') {
       this.store.transitionTask(taskId, {
         nextState: 'QUEUED',
         actor,
@@ -271,7 +273,7 @@ export class Publisher {
       reason: '开始准备朋友圈编辑界面（不会发表）',
       metadata: { attemptId: attempt.attemptId, idempotencyKey },
       patch: {
-        approvalId: approval.approvalId,
+        approvalId: approval?.approvalId ?? null,
         contentHash: snapshot.contentHash,
         assetManifestHash: snapshot.assetManifestHash,
         accountId: snapshot.accountId,
@@ -396,11 +398,14 @@ export class Publisher {
       });
     }
     const snapshot = this.snapshotFor(task);
-    const approval = this.findApproval(taskId, approvalId);
+    const approval = this.config.publishMode === 'APPROVAL_REQUIRED' ? this.findApproval(taskId, approvalId) : null;
     const attempts = this.store.listAttemptsForTask(taskId);
     const attempt = attempts.find((item) => item.state === 'PREPARED');
     if (attempt === undefined) {
       throw new MomentsError('CONFLICT', '没有已准备完成的发布尝试，请先调用 moments_prepare_desktop');
+    }
+    if (attempt.mode !== this.config.publishMode) {
+      throw new MomentsError('CONFLICT', '准备后发表模式发生变化，请取消旧尝试并重新准备');
     }
     if (attempt.contentHash !== snapshot.contentHash) {
       throw new MomentsError('CONTENT_CHANGED', '准备后内容发生变化，必须重新准备并重新审批');
@@ -411,7 +416,7 @@ export class Publisher {
 
     // 先核销审批，再点击；核销失败则不点击。
     this.store.runInTransaction(() => {
-      this.approvalService.consumeForPublish({
+      if (approval) this.approvalService.consumeForPublish({
         approvalId: approval.approvalId,
         taskId,
         snapshot,
@@ -421,10 +426,11 @@ export class Publisher {
       this.store.transitionTask(taskId, {
         nextState: 'PUBLISHING',
         actor,
-        reason: '所有者授权发表，核销审批',
+        reason: approval ? '所有者授权发表，核销审批' : '按所有者选择的免审批模式发表已审核内容',
         metadata: {
           attemptId: attempt.attemptId,
-          approvalId: approval.approvalId,
+          approvalId: approval?.approvalId ?? null,
+          publishMode: this.config.publishMode,
           contentHash: snapshot.contentHash,
         },
       });
@@ -437,7 +443,8 @@ export class Publisher {
         attemptId: attempt.attemptId,
         contentHash: snapshot.contentHash,
         accountId: snapshot.accountId,
-        approvalId: approval.approvalId,
+        approvalId: approval?.approvalId ?? '',
+        publishMode: this.config.publishMode,
       });
     } catch (error) {
       // 请求可能已经到达执行器并点击；无法确认，必须 UNCERTAIN。

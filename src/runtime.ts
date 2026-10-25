@@ -16,14 +16,22 @@ import {
 import type {
   AdapterHealth,
   ApprovalRequestView,
+  ChatMemoryAgentView,
+  ChatMemorySettingsView,
+  ChatMemoryView,
+  ChatSyncResult,
   ImageTaskRecord,
   MediaAssetRecord,
+  MemberImpressionPatch,
+  MemberImpressionRecord,
   PreviewPackage,
   PublishAttemptRecord,
   PublishMode,
   TaskRecord,
 } from './domain/types.js';
 import { parseConfig, type MomentsConfig } from './config.js';
+import { PUBLISH_MODES } from './domain/types.js';
+import { withVerifiedWechatAccount } from './adapters/windows/verified-account.js';
 import type {
   ImageFacade,
   LlmClient,
@@ -36,6 +44,7 @@ import type {
 import type { MomentsStore } from './storage/store.js';
 import { ControlState } from './security/kill-switch.js';
 import { PersonaLoader, type PersonaDocument } from './brain/persona.js';
+import { WritingSkillLibrary, WRITING_SKILL_IDS } from './brain/writing-skills.js';
 import { IdeaGenerator, assertKnownSourceType, type IdeaCandidate } from './brain/idea-generator.js';
 import { ContentComposer } from './brain/content-composer.js';
 import { ContentReviewer } from './brain/content-reviewer.js';
@@ -44,11 +53,13 @@ import { ApprovalService } from './approval/approval-service.js';
 import { assertOwnerIdentity, parseOwnerCommand } from './approval/owner-channels.js';
 import { Publisher } from './publishing/publisher.js';
 import { effectivePublishMode } from './publishing/publish-policy.js';
+import { HumanizeScheduler, type HumanizeStatus, type HumanizeTickResult } from './publishing/humanize-scheduler.js';
 import { redactSecrets } from './security/redaction.js';
 import { resolveInsideRoot } from './security/path-guard.js';
 import { extractJsonObject } from './security/prompt-injection.js';
 import { expirePendingTasks } from './storage/recovery.js';
 import { PROVIDER_NAME_TO_KIND, PROVIDER_KIND_TO_NAME } from './image/providers/index.js';
+import { ChatMemoryService } from './memory/service.js';
 
 export interface RuntimeDeps {
   readonly config: MomentsConfig;
@@ -85,6 +96,8 @@ export interface RuntimeStatus {
   readonly openTasks: readonly TaskRecord[];
   readonly pendingApprovals: readonly ReturnType<MomentsStore['listPendingApprovals']>[number][];
   readonly counts: Record<string, number>;
+  /** 拟人化自动发送状态（只读；默认关闭时 enabled=false）。 */
+  readonly humanize: HumanizeStatus;
 }
 
 const MAX_COMMAND_MESSAGES_PER_POLL = 20;
@@ -93,6 +106,7 @@ export class MomentsRuntime {
   readonly control: ControlState;
   readonly approvalService: ApprovalService;
   readonly publisher: Publisher;
+  readonly humanizeScheduler: HumanizeScheduler;
   readonly decision: DecisionEngine;
   private readonly personaLoader: PersonaLoader;
   private personaCache: PersonaDocument | null = null;
@@ -101,6 +115,7 @@ export class MomentsRuntime {
   private readonly reviewer: ContentReviewer;
   private commandTimerDisposer: (() => void) | null = null;
   private scheduleTimerDisposer: (() => void) | null = null;
+  private humanizeTimerDisposer: (() => void) | null = null;
   private readonly seenCommandIds = new Set<string>();
   private lastCommandAt = '';
   private lastAutonomousAt: string | null = null;
@@ -113,6 +128,8 @@ export class MomentsRuntime {
   private readonly composingTasks = new Set<string>();
   private readonly pending = new Set<Promise<void>>();
   private readonly abort = new AbortController();
+  private readonly writingSkillLibrary: WritingSkillLibrary;
+  private readonly chatMemory: ChatMemoryService;
 
   private assertActive(): void {
     if (this.stopped) throw new MomentsError('POLICY_DENIED', '运行时已停止');
@@ -141,15 +158,49 @@ export class MomentsRuntime {
   deleteMemory(memoryId: string): void { this.deps.store.deleteMemory(memoryId); }
 
   constructor(private readonly deps: RuntimeDeps) {
+    this.writingSkillLibrary = new WritingSkillLibrary(deps.packageRoot, deps.logger);
+    const savedMode = deps.store.getSetting('publish_mode');
+    if (savedMode && PUBLISH_MODES.includes(savedMode as PublishMode)) {
+      deps.config.publishMode = savedMode as PublishMode;
+      deps.config.policy.requireApproval = savedMode === 'APPROVAL_REQUIRED';
+    }
+    const savedPublishSchedule = deps.store.getSetting('publish_schedule_config');
+    if (savedPublishSchedule) {
+      const policy = JSON.parse(savedPublishSchedule) as Record<string, unknown>;
+      deps.config.policy = parseConfig({ ...deps.config, policy: { ...deps.config.policy, ...policy } }).policy;
+    }
+    const savedChatMemory = deps.store.getSetting('chat_memory_config');
+    if (savedChatMemory) {
+      try {
+        const chatMemory = JSON.parse(savedChatMemory) as Record<string, unknown>;
+        deps.config.chatMemory = parseConfig({
+          ...deps.config,
+          chatMemory: { ...deps.config.chatMemory, ...chatMemory },
+        }).chatMemory;
+      } catch (error) {
+        deps.logger.warn('已保存的社交记忆配置无效，使用配置默认值', {
+          error: error instanceof Error ? error.message : 'unknown',
+        });
+      }
+    }
     this.clock = deps.clock ?? (() => new Date());
     this.env = deps.env ?? process.env;
+    this.chatMemory = new ChatMemoryService({
+      store: deps.store,
+      config: () => this.deps.config.chatMemory,
+      wechat: () => this.deps.wechat,
+      llm: deps.llm,
+      logger: deps.logger,
+      clock: this.clock,
+    });
     this.control = new ControlState(deps.store);
     this.decision = new DecisionEngine();
     this.approvalService = new ApprovalService(deps.store, deps.config, deps.logger, this.clock);
+    const publishingDesktop = withVerifiedWechatAccount(deps.desktop, deps.config.wechatAgent.enabled ? deps.wechat : null);
     this.publisher = new Publisher(
       deps.store,
       this.approvalService,
-      deps.desktop,
+      publishingDesktop,
       deps.config,
       this.control,
       deps.logger,
@@ -157,6 +208,17 @@ export class MomentsRuntime {
       this.clock,
       this.env,
     );
+    this.humanizeScheduler = new HumanizeScheduler({
+      config: deps.config,
+      store: deps.store,
+      control: this.control,
+      publisher: this.publisher,
+      desktop: publishingDesktop,
+      ownerChannel: deps.ownerChannel,
+      logger: deps.logger,
+      clock: this.clock,
+      env: this.env,
+    });
     this.personaLoader = new PersonaLoader(
       deps.packageRoot,
       { soul: deps.config.workspace.personaFile, visualStyle: deps.config.workspace.visualStyleFile },
@@ -184,9 +246,11 @@ export class MomentsRuntime {
     );
     this.composer = new ContentComposer(cancellableLlm, () => this.persona(), deps.logger, {
       maxTextLength: deps.config.policy.maxTextLength,
+      writingInstructions: () => this.writingSkillLibrary.instructions(this.writingSkillsView().enabledIds),
     });
     this.reviewer = new ContentReviewer(this.decision, cancellableLlm, deps.logger, {
       useLlmReview: true,
+      writingInstructions: () => this.writingSkillLibrary.instructions(this.writingSkillsView().enabledIds),
     });
   }
 
@@ -197,6 +261,46 @@ export class MomentsRuntime {
       soul: this.deps.store.getSetting('persona_soul') ?? this.personaCache.soul,
       visualStyle: this.deps.store.getSetting('persona_visual_style') ?? this.personaCache.visualStyle,
     };
+  }
+
+  writingSkillsView() {
+    const raw = this.deps.store.getSetting('writing_skills');
+    let enabledIds: string[] = [...WRITING_SKILL_IDS];
+    if (raw !== undefined) {
+      try {
+        const saved = JSON.parse(raw) as unknown;
+        enabledIds = Array.isArray(saved) ? saved.filter((id): id is string =>
+          typeof id === 'string' && WRITING_SKILL_IDS.includes(id as typeof WRITING_SKILL_IDS[number])) : [];
+      } catch { enabledIds = []; }
+    }
+    return { enabledIds, skills:this.writingSkillLibrary.catalog() };
+  }
+
+  environmentView() {
+    const config = this.deps.config;
+    return { packageRoot:this.deps.packageRoot, dataDir:this.deps.dataDir,
+      adminBaseUrl:`http://127.0.0.1:${config.adminServer.port}`,
+      adminTokenFile:config.adminServer.tokenFile === null ? path.join(this.deps.dataDir,'admin-token.txt') : path.resolve(this.deps.packageRoot,config.adminServer.tokenFile),
+      wechatAgent:{ readerBaseUrl:config.wechatAgent.readerBaseUrl, hookBaseUrl:config.wechatAgent.hookBaseUrl,
+        readerConfigPath:config.wechatAgent.readerConfigPath } };
+  }
+
+  updateWritingSkills(input: Record<string, unknown>): ReturnType<MomentsRuntime['writingSkillsView']> {
+    if (Object.keys(input).some(key => key !== 'enabledIds') || !Array.isArray(input.enabledIds) ||
+        input.enabledIds.some(id => typeof id !== 'string' || !WRITING_SKILL_IDS.includes(id as typeof WRITING_SKILL_IDS[number]))) {
+      throw new MomentsError('INVALID_INPUT', '请选择已安装的表达技能');
+    }
+    const enabledIds = WRITING_SKILL_IDS.filter(id => (input.enabledIds as string[]).includes(id));
+    const catalog = this.writingSkillLibrary.catalog();
+    if (enabledIds.some(id => !catalog.find(skill => skill.id === id)?.available)) {
+      throw new MomentsError('INVALID_INPUT', '所选技能文件缺失，请重新安装完整插件包');
+    }
+    this.deps.store.runInTransaction(() => {
+      this.deps.store.setSetting('writing_skills', JSON.stringify(enabledIds));
+      this.deps.store.appendAudit({ at:this.iso(), actor:'owner', action:'writing_skills_changed', taskId:null,
+        previousState:null, nextState:null, reason:'所有者修改表达技能', metadata:{enabledIds} });
+    });
+    return this.writingSkillsView();
   }
 
   updatePersona(input: { soul: string; visualStyle: string }): void {
@@ -218,6 +322,96 @@ export class MomentsRuntime {
       return { scheduleEnabled: validated.scheduleEnabled, scheduler: validated.scheduler };
     }
     return { scheduleEnabled: this.deps.config.scheduleEnabled, scheduler: this.deps.config.scheduler };
+  }
+
+  automationView() {
+    const policy = this.deps.config.policy;
+    return { ...this.scheduleView(), policy: {
+      dailyLimit: policy.dailyLimit, minIntervalMinutes: policy.minIntervalMinutes,
+      quietHours: policy.quietHours, timeZone: policy.timeZone, humanize: { ...policy.humanize },
+    }, status: this.humanizeStatus() };
+  }
+
+  updateAutomation(input: Record<string, unknown>): ReturnType<MomentsRuntime['automationView']> {
+    if (this.publisher.isBusy) throw new MomentsError('CONFLICT', '正在执行桌面任务，请等待结束后保存调度');
+    const checkKeys = (value: unknown, allowed: readonly string[], name: string): Record<string, unknown> => {
+      if (value === null || typeof value !== 'object' || Array.isArray(value) ||
+          Object.keys(value).some((key) => !allowed.includes(key))) {
+        throw new MomentsError('INVALID_INPUT', `${name} 只允许修改指定的调度字段`);
+      }
+      return value as Record<string, unknown>;
+    };
+    checkKeys(input, ['scheduleEnabled', 'scheduler', 'policy'], '自主调度');
+    const scheduler = checkKeys(input.scheduler === undefined ? {} : input.scheduler, ['tickSeconds', 'ideaProbability', 'jitterSeconds'], '创作调度');
+    const policy = checkKeys(input.policy === undefined ? {} : input.policy, ['dailyLimit', 'minIntervalMinutes', 'quietHours', 'timeZone', 'humanize'], '发送策略');
+    const humanize = checkKeys(policy.humanize === undefined ? {} : policy.humanize,
+      ['enabled', 'delaySeconds', 'activeHours', 'minIntervalSeconds', 'jitterSeconds', 'maxPublishAttempts', 'backoffSeconds'], '自动发送');
+    const current = this.getConfig();
+    let validated: MomentsConfig;
+    try { validated = parseConfig({ ...current,
+      scheduleEnabled: 'scheduleEnabled' in input ? input.scheduleEnabled : current.scheduleEnabled,
+      scheduler: { ...current.scheduler, ...scheduler },
+      policy: { ...current.policy, ...policy, humanize: { ...current.policy.humanize, ...humanize } },
+    }); } catch (error) {
+      if (!(error instanceof MomentsError)) throw error;
+      const labels: Record<string, string> = {
+        'config.policy.humanize.delaySeconds[0]': '发送随机延迟下限', 'config.policy.humanize.delaySeconds[1]': '发送随机延迟上限',
+        'config.policy.humanize.backoffSeconds[0]': '失败退避下限', 'config.policy.humanize.backoffSeconds[1]': '失败退避上限',
+        'config.policy.humanize.activeHours': '活跃时段', 'config.policy.humanize.minIntervalSeconds': '额外发送间隔',
+        'config.policy.humanize.jitterSeconds': '发送时刻抖动', 'config.policy.humanize.maxPublishAttempts': '最大自动尝试次数',
+        'config.policy.humanize.enabled': '自动发送开关', 'config.policy.dailyLimit': '每日发表上限',
+        'config.policy.minIntervalMinutes': '最小发表间隔', 'config.policy.quietHours': '静默时段',
+        'config.scheduler.tickSeconds': '检查间隔', 'config.scheduler.ideaProbability': '每次创作概率',
+        'config.scheduler.jitterSeconds': '创作随机延迟', 'config.scheduleEnabled': '自主创作开关',
+      };
+      let message = error.message;
+      for (const [key, label] of Object.entries(labels)) message = message.replaceAll(key, label);
+      throw new MomentsError('INVALID_INPUT', message, { cause: error });
+    }
+    try { new Intl.DateTimeFormat('zh-CN', { timeZone: validated.policy.timeZone }).format(this.now()); }
+    catch { throw new MomentsError('INVALID_INPUT', '时区无效，例如 Asia/Singapore 或 Asia/Shanghai'); }
+    const schedule = { scheduleEnabled: validated.scheduleEnabled, scheduler: validated.scheduler };
+    const nextPolicy = { dailyLimit: validated.policy.dailyLimit, minIntervalMinutes: validated.policy.minIntervalMinutes,
+      quietHours: validated.policy.quietHours, timeZone: validated.policy.timeZone, humanize: validated.policy.humanize };
+    this.deps.store.runInTransaction(() => {
+      this.deps.store.setSetting('schedule_config', JSON.stringify(schedule));
+      this.deps.store.setSetting('publish_schedule_config', JSON.stringify(nextPolicy));
+      // Keep queued delays and retry budgets; every tick rechecks current limits/windows.
+      this.deps.store.setSetting('scheduler_next_at', '0');
+      this.deps.store.appendAudit({ at: this.iso(), actor: 'owner', action: 'automation_settings_changed', taskId: null,
+        previousState: null, nextState: null, reason: '所有者保存自主创作与自动发送调度',
+        metadata: { scheduleEnabled: schedule.scheduleEnabled, sendingEnabled: nextPolicy.humanize.enabled } });
+    });
+    Object.assign(this.deps.config.policy, nextPolicy);
+    return this.automationView();
+  }
+
+  publishModeView() {
+    return { mode: this.deps.config.publishMode, requireApproval: this.deps.config.publishMode === 'APPROVAL_REQUIRED' };
+  }
+
+  updatePublishMode(input: Record<string, unknown>): ReturnType<MomentsRuntime['publishModeView']> {
+    const mode = input.mode as PublishMode;
+    if (!PUBLISH_MODES.includes(mode)) throw new MomentsError('INVALID_INPUT', '发表模式必须是三级选项之一');
+    if (input.expectedMode !== undefined && input.expectedMode !== this.deps.config.publishMode) {
+      throw new MomentsError('CONFLICT', '发表模式已由其他窗口修改，请刷新后重试');
+    }
+    if (mode === this.deps.config.publishMode) {
+      this.deps.store.setSetting('publish_mode', mode);
+      return this.publishModeView();
+    }
+    if (this.publisher.isBusy || this.deps.store.listTasks(['PREPARING', 'PREPARED', 'PUBLISHING'], 1).length) {
+      throw new MomentsError('CONFLICT', '存在准备中、已准备或发表中的任务，请先取消或完成该任务再切换模式');
+    }
+    const previousMode = this.deps.config.publishMode;
+    this.deps.store.runInTransaction(() => {
+      this.deps.store.setSetting('publish_mode', mode);
+      this.deps.store.appendAudit({ at: this.iso(), actor: 'owner', action: 'publish_mode_changed', taskId: null,
+        previousState: null, nextState: null, reason: '所有者通过三级选项修改发表模式', metadata: { previousMode, mode } });
+    });
+    this.deps.config.publishMode = mode;
+    this.deps.config.policy.requireApproval = mode === 'APPROVAL_REQUIRED';
+    return this.publishModeView();
   }
 
   updateSchedule(input: Record<string, unknown>): ReturnType<MomentsRuntime['scheduleView']> {
@@ -305,6 +499,25 @@ export class MomentsRuntime {
           };
     const counts = this.deps.store.countTasksByState();
     counts.assets = this.deps.store.countAssets();
+    const chatCounts = this.deps.store.chatMemoryCounts();
+    const chatConversations = this.deps.store.listChatConversations({ enabledOnly: true });
+    const lastChatSync = chatConversations
+      .map((conversation) => conversation.lastSyncedAt)
+      .filter((value): value is string => value !== null)
+      .sort()
+      .at(-1) ?? null;
+    const chatMemory: AdapterHealth = {
+      status: this.deps.config.chatMemory.enabled ? 'ok' : 'not_configured',
+      message: this.deps.config.chatMemory.enabled
+        ? `社交记忆已启用：${chatCounts.conversations} 个会话 / ${chatCounts.members} 条人物印象`
+        : '社交记忆未启用（chatMemory.enabled=false）',
+      details: {
+        enabled: this.deps.config.chatMemory.enabled,
+        includePrivate: this.deps.config.chatMemory.includePrivate,
+        ...chatCounts,
+        lastSyncedAt: lastChatSync,
+      },
+    };
     const images: AdapterHealth = {
       status: imageCaps.length === 0 ? 'unavailable' : 'degraded',
       message:
@@ -331,6 +544,7 @@ export class MomentsRuntime {
       desktopExecutor: desktop,
       llm: llmHealth,
       images,
+      chatMemory,
       counts,
       checkedAt: this.iso(),
     };
@@ -356,6 +570,7 @@ export class MomentsRuntime {
       openTasks: this.deps.store.listOpenTasks(20),
       pendingApprovals: this.deps.store.listPendingApprovals(20),
       counts: this.deps.store.countTasksByState(),
+      humanize: this.humanizeScheduler.status(),
     };
   }
 
@@ -392,10 +607,17 @@ export class MomentsRuntime {
       return { task: null, idea: null, silent: true, reason: canCreate.reason };
     }
     const ownerTopics = input.topic === undefined ? [] : [input.topic];
+    // 社交记忆按配置间隔惰性同步；失败只降级为“本次没有聊天信号”，不影响创作。
+    await this.chatMemory.maybeAutoSync().catch((error: unknown) => {
+      this.deps.logger.warn('社交记忆自动同步失败，本次不使用聊天信号', {
+        error: error instanceof Error ? error.message : 'unknown',
+      });
+    });
     const result = await this.ideaGenerator.generate({
       ownerTopics,
       savedOpinions: this.memoryTexts(),
       recentTexts: context.recentTexts,
+      chatSignals: this.chatMemory.ideaSignals(),
       count: input.topic === undefined ? 3 : 1,
     });
     if (result.candidates.length === 0) {
@@ -415,6 +637,25 @@ export class MomentsRuntime {
     let bestScore = -1;
     let rejectionReason = '';
     for (const candidate of result.candidates) {
+      try {
+        this.chatMemory.assertNoLeak(
+          `${candidate.topic}\n${candidate.motivation}\n${candidate.sourceEvidence}`,
+          '选题',
+        );
+      } catch (error) {
+        rejectionReason = error instanceof Error ? error.message : '候选主题疑似包含聊天隐私';
+        this.deps.store.appendAudit({
+          at: this.iso(),
+          actor: 'agent',
+          action: 'idea_privacy_blocked',
+          taskId: null,
+          previousState: null,
+          nextState: null,
+          reason: rejectionReason,
+          metadata: { sourceType: candidate.sourceType },
+        });
+        continue;
+      }
       const evaluation = this.decision.evaluateCandidate(candidate, context);
       const score = evaluation.decision.allowed ? this.decision.computeScore(candidate.scores, evaluation.duplicateSimilarity) : -1;
       if (evaluation.decision.allowed && score > bestScore) {
@@ -433,7 +674,8 @@ export class MomentsRuntime {
         previousState: null,
         nextState: null,
         reason: rejectionReason || '候选想法未通过决策规则',
-        metadata: { candidates: result.candidates.map((candidate) => candidate.topic) },
+        // 不把候选 topic 原文写进审计：其中可能包含刚被隐私门禁拦下的内容。
+        metadata: { candidateCount: result.candidates.length },
       });
       return { task: null, idea: null, silent: true, reason: rejectionReason || '候选想法未通过决策规则' };
     }
@@ -497,7 +739,7 @@ export class MomentsRuntime {
     review: Awaited<ReturnType<ContentReviewer['review']>>;
   }> {
     const task = this.deps.store.requireTask(taskId);
-    if (!['IDEA_CREATED', 'DRAFTING', 'DRAFT_READY', 'IMAGE_READY', 'READY_FOR_APPROVAL', 'APPROVED'].includes(task.state)) {
+    if (!['IDEA_CREATED', 'DRAFTING', 'DRAFT_READY', 'IMAGE_READY', 'READY_FOR_APPROVAL', 'READY_TO_PUBLISH', 'APPROVED'].includes(task.state)) {
       throw new MomentsError('CONFLICT', `任务状态 ${task.state} 不允许创作草稿`);
     }
     const ideaRecord = this.deps.store.getIdeaByTask(taskId);
@@ -542,7 +784,24 @@ export class MomentsRuntime {
       recentTexts: context.recentTexts,
       feedback: options.feedback,
       memories: this.memoryTexts(),
+      socialContext: this.chatMemory.composeBrief(),
     });
+    try {
+      // 硬门禁：不允许把聊天原话或真实昵称写进公开朋友圈。
+      this.chatMemory.assertNoLeak(composed.text, '草稿');
+    } catch (error) {
+      this.deps.store.appendAudit({
+        at: this.iso(),
+        actor: 'agent',
+        action: 'draft_privacy_blocked',
+        taskId,
+        previousState: null,
+        nextState: null,
+        reason: error instanceof Error ? error.message : '草稿疑似包含聊天隐私',
+        metadata: {},
+      });
+      throw error;
+    }
     this.assertActive();
     if (this.deps.store.requireTask(taskId).state !== 'DRAFTING') {
       throw new MomentsError('CONFLICT', '创作期间任务状态已变化');
@@ -636,7 +895,7 @@ export class MomentsRuntime {
       action: 'draft_reviewed',
       taskId,
       previousState: 'REVIEWING',
-      nextState: review.passed ? 'READY_FOR_APPROVAL' : 'DRAFTING',
+      nextState: review.passed ? (this.deps.config.publishMode === 'POLICY_AUTONOMOUS' ? 'READY_TO_PUBLISH' : 'READY_FOR_APPROVAL') : 'DRAFTING',
       reason: review.passed ? '审核通过' : '审核未通过',
       metadata: {
         flags: review.flags,
@@ -655,9 +914,9 @@ export class MomentsRuntime {
       return { task: this.deps.store.requireTask(taskId), passed: false, notes: review.notes, flags: review.flags };
     }
     const updated = this.deps.store.transitionTask(taskId, {
-      nextState: 'READY_FOR_APPROVAL',
+      nextState: this.deps.config.publishMode === 'POLICY_AUTONOMOUS' ? 'READY_TO_PUBLISH' : 'READY_FOR_APPROVAL',
       actor: 'agent',
-      reason: '审核通过，等待所有者审批',
+      reason: this.deps.config.publishMode === 'POLICY_AUTONOMOUS' ? '内容审核通过，等待直接发表' : '审核通过，等待后续处理',
       metadata: { flags: review.flags, llmReviewed: review.llmReviewed },
       patch: {
         contentHash,
@@ -1038,6 +1297,9 @@ export class MomentsRuntime {
     request: ApprovalRequestView;
     delivered: boolean;
   }> {
+    if (this.deps.store.requireTask(taskId).state === 'READY_TO_PUBLISH') {
+      this.deps.store.transitionTask(taskId, { nextState: 'READY_FOR_APPROVAL', actor: 'owner', reason: '显式申请逐条审批' });
+    }
     const task = this.deps.store.requireTask(taskId);
     if (task.state !== 'READY_FOR_APPROVAL') {
       throw new MomentsError('CONFLICT', `任务状态 ${task.state} 不允许申请审批`, {
@@ -1080,11 +1342,28 @@ export class MomentsRuntime {
   }
 
   async publish(taskId: string, approvalId?: string): Promise<ReturnType<Publisher['publish']>> {
+    if (this.deps.config.publishMode === 'POLICY_AUTONOMOUS' &&
+        ['READY_TO_PUBLISH', 'READY_FOR_APPROVAL', 'APPROVED', 'QUEUED'].includes(this.deps.store.requireTask(taskId).state)) {
+      await this.publisher.prepare(taskId, 'owner');
+    }
     return this.publisher.publish(taskId, approvalId ?? null, 'owner');
   }
 
   async verify(attemptId: string): Promise<ReturnType<Publisher['verify']>> {
     return this.publisher.verify(attemptId);
+  }
+
+  /**
+   * 拟人化自动发送单次 tick（测试与调度器使用）。
+   * 默认关闭时立即返回 disabled，不产生任何外部副作用。
+   */
+  async humanizeTick(): Promise<HumanizeTickResult> {
+    return this.humanizeScheduler.tick();
+  }
+
+  /** 只读状态：配置、今日计数、下次可发时间、队列与最后错误。 */
+  humanizeStatus(): HumanizeStatus {
+    return this.humanizeScheduler.status();
   }
 
   resolveUncertain(attemptId: string, resolution: 'PUBLISHED' | 'FAILED', note: string): ReturnType<Publisher['resolveUncertain']> {
@@ -1180,7 +1459,7 @@ export class MomentsRuntime {
     }
     const review = await this.reviewDraft(taskId);
     let approval: Awaited<ReturnType<MomentsRuntime['requestApproval']>> | null = null;
-    if (review.passed) approval = await this.requestApproval(taskId);
+    if (review.passed && this.deps.config.publishMode === 'APPROVAL_REQUIRED') approval = await this.requestApproval(taskId);
     return {
       silent: false,
       taskId,
@@ -1194,7 +1473,7 @@ export class MomentsRuntime {
     const composed = await this.composeDraft(taskId, options);
     const review = await this.reviewDraft(taskId);
     let approval: Awaited<ReturnType<MomentsRuntime['requestApproval']>> | null = null;
-    if (review.passed) approval = await this.requestApproval(taskId);
+    if (review.passed && this.deps.config.publishMode === 'APPROVAL_REQUIRED') approval = await this.requestApproval(taskId);
     return { composed, review, approval, detail: await this.taskDetail(taskId) };
   }
 
@@ -1202,7 +1481,7 @@ export class MomentsRuntime {
   async reviewTask(taskId: string): Promise<Record<string, unknown>> {
     const review = await this.reviewDraft(taskId);
     let approval: Awaited<ReturnType<MomentsRuntime['requestApproval']>> | null = null;
-    if (review.passed) approval = await this.requestApproval(taskId);
+    if (review.passed && this.deps.config.publishMode === 'APPROVAL_REQUIRED') approval = await this.requestApproval(taskId);
     return { review, approval, detail: await this.taskDetail(taskId) };
   }
 
@@ -1223,6 +1502,200 @@ export class MomentsRuntime {
   personaView(): { soul: string; visualStyle: string; source: string; loadedAt: string } {
     const persona = this.persona();
     return { soul: persona.soul, visualStyle: persona.visualStyle, source: persona.source, loadedAt: persona.loadedAt };
+  }
+
+  // -------------------------------------------------------------------------
+  // 社交记忆（群聊 / 私聊 → 人物印象）
+  // -------------------------------------------------------------------------
+
+  /** 所有者视图（含真实昵称），只允许本机管理令牌访问。 */
+  chatMemoryView(): ChatMemoryView {
+    return this.chatMemory.view();
+  }
+
+  /** Agent 视图：只有别名与摘要。 */
+  agentChatMemoryView(): ChatMemoryAgentView {
+    return this.chatMemory.agentView();
+  }
+
+  updateChatMemorySettings(input: Record<string, unknown>): ChatMemorySettingsView {
+    const allowed = [
+      'enabled',
+      'includePrivate',
+      'conversations',
+      'syncIntervalMinutes',
+      'maxMessagesPerConversation',
+      'retentionDays',
+      'impressionTtlDays',
+      'maxMembersPerConversation',
+      'anonymizeInPrompts',
+      'useLlmExtraction',
+    ];
+    if (Object.keys(input).some((key) => !allowed.includes(key))) {
+      throw new MomentsError('INVALID_INPUT', '社交记忆设置只允许修改指定的字段');
+    }
+    let validated: MomentsConfig;
+    try {
+      validated = parseConfig({
+        ...this.deps.config,
+        chatMemory: { ...this.deps.config.chatMemory, ...input },
+      });
+    } catch (error) {
+      if (!(error instanceof MomentsError)) throw error;
+      throw new MomentsError('INVALID_INPUT', error.message, { cause: error });
+    }
+    this.deps.store.runInTransaction(() => {
+      this.deps.store.setSetting('chat_memory_config', JSON.stringify(validated.chatMemory));
+      this.deps.store.appendAudit({
+        at: this.iso(),
+        actor: 'owner',
+        action: 'chat_memory_settings_changed',
+        taskId: null,
+        previousState: null,
+        nextState: null,
+        reason: '所有者修改社交记忆设置',
+        metadata: {
+          enabled: validated.chatMemory.enabled,
+          includePrivate: validated.chatMemory.includePrivate,
+          retentionDays: validated.chatMemory.retentionDays,
+        },
+      });
+    });
+    this.deps.config.chatMemory = validated.chatMemory;
+    return validated.chatMemory;
+  }
+
+  async syncChatMemory(): Promise<ChatSyncResult> {
+    const result = await this.chatMemory.sync({ force: true });
+    this.deps.store.appendAudit({
+      at: this.iso(),
+      actor: 'owner',
+      action: 'chat_memory_sync_requested',
+      taskId: null,
+      previousState: null,
+      nextState: null,
+      reason: '所有者或 Agent 请求同步社交记忆',
+      metadata: {
+        conversations: result.conversations,
+        newMessages: result.newMessages,
+        impressionsUpdated: result.impressionsUpdated,
+      },
+    });
+    return result;
+  }
+
+  updateChatMemberImpression(
+    impressionId: string,
+    input: Record<string, unknown>,
+    actor: 'owner' | 'agent' = 'owner',
+  ): MemberImpressionRecord {
+    if (!this.deps.config.chatMemory.enabled) {
+      throw new MomentsError('CHAT_MEMORY_DISABLED', '社交记忆未启用（chatMemory.enabled=false）');
+    }
+    const patch = this.normalizeImpressionPatch(input, actor);
+    const updated = this.chatMemory.updateMember(impressionId, patch, actor);
+    this.deps.store.appendAudit({
+      at: this.iso(),
+      actor,
+      action: 'chat_member_impression_updated',
+      taskId: null,
+      previousState: null,
+      nextState: null,
+      reason: actor === 'owner' ? '所有者修正人物印象' : 'Agent 追加人物观察',
+      metadata: { impressionId: updated.impressionId, fields: Object.keys(patch) },
+    });
+    return updated;
+  }
+
+  deleteChatMemberImpression(impressionId: string): void {
+    this.chatMemory.deleteMember(impressionId);
+    this.deps.store.appendAudit({
+      at: this.iso(),
+      actor: 'owner',
+      action: 'chat_member_impression_deleted',
+      taskId: null,
+      previousState: null,
+      nextState: null,
+      reason: '所有者删除人物印象',
+      metadata: { impressionId },
+    });
+  }
+
+  purgeChatConversation(conversationKey: string): { messages: number; members: number } {
+    const removed = this.chatMemory.purgeConversation(conversationKey);
+    this.deps.store.appendAudit({
+      at: this.iso(),
+      actor: 'owner',
+      action: 'chat_conversation_purged',
+      taskId: null,
+      previousState: null,
+      nextState: null,
+      reason: '所有者清除社交记忆会话',
+      metadata: { conversationKey, ...removed },
+    });
+    return removed;
+  }
+
+  private normalizeImpressionPatch(
+    input: Record<string, unknown>,
+    actor: 'owner' | 'agent',
+  ): MemberImpressionPatch {
+    const allowed = actor === 'owner'
+      ? ['alias', 'summary', 'traits', 'topics', 'style', 'status']
+      : ['summary', 'traits', 'topics', 'style'];
+    if (Object.keys(input).some((key) => !allowed.includes(key))) {
+      throw new MomentsError(
+        'INVALID_INPUT',
+        actor === 'owner' ? '人物印象只允许修改别名、摘要、标签、话题、风格、状态' : 'Agent 只能追加摘要、标签、话题、风格',
+      );
+    }
+    const patch: {
+      alias?: string;
+      summary?: string;
+      traits?: readonly string[];
+      topics?: readonly string[];
+      style?: string;
+      status?: MemberImpressionRecord['status'];
+    } = {};
+    if (input.alias !== undefined) {
+      if (typeof input.alias !== 'string' || !/^[\u4e00-\u9fa5A-Za-z0-9_]{1,8}$/.test(input.alias.trim())) {
+        throw new MomentsError('INVALID_INPUT', '别名只能是 1~8 个中文/字母/数字/下划线');
+      }
+      patch.alias = input.alias.trim();
+    }
+    if (input.summary !== undefined) {
+      if (typeof input.summary !== 'string' || input.summary.trim() === '' || input.summary.length > 300) {
+        throw new MomentsError('INVALID_INPUT', '印象摘要必须是非空字符串，最多 300 字');
+      }
+      patch.summary = input.summary.trim();
+    }
+    if (input.style !== undefined) {
+      if (typeof input.style !== 'string' || input.style.length > 120) {
+        throw new MomentsError('INVALID_INPUT', '说话风格最多 120 字');
+      }
+      patch.style = input.style.trim();
+    }
+    if (input.traits !== undefined) {
+      if (!Array.isArray(input.traits) || input.traits.length > 6 ||
+          input.traits.some((item) => typeof item !== 'string' || item.trim() === '' || item.trim().length > 12)) {
+        throw new MomentsError('INVALID_INPUT', '标签最多 6 个，每个不超过 12 字');
+      }
+      patch.traits = (input.traits as string[]).map((item) => item.trim());
+    }
+    if (input.topics !== undefined) {
+      if (!Array.isArray(input.topics) || input.topics.length > 8 ||
+          input.topics.some((item) => typeof item !== 'string' || item.trim() === '' || item.trim().length > 16)) {
+        throw new MomentsError('INVALID_INPUT', '话题最多 8 个，每个不超过 16 字');
+      }
+      patch.topics = (input.topics as string[]).map((item) => item.trim());
+    }
+    if (input.status !== undefined) {
+      if (input.status !== 'new' && input.status !== 'observed' && input.status !== 'owner_edited') {
+        throw new MomentsError('INVALID_INPUT', '人物印象状态无效');
+      }
+      patch.status = input.status;
+    }
+    return patch;
   }
 
   controlAction(action: 'pause' | 'resume' | 'kill' | 'unkill', reason: string, actor = 'owner'): void {
@@ -1257,9 +1730,15 @@ export class MomentsRuntime {
     const canCreate = this.decision.canCreateNow(context);
     if (!canCreate.allowed) return { created: false, reason: canCreate.reason };
     this.lastAutonomousAt = this.iso();
+    await this.chatMemory.maybeAutoSync().catch((error: unknown) => {
+      this.deps.logger.warn('社交记忆自动同步失败，本次不使用聊天信号', {
+        error: error instanceof Error ? error.message : 'unknown',
+      });
+    });
     const generated = await this.ideaGenerator.generate({
       savedOpinions: this.memoryTexts(),
       recentTexts: context.recentTexts,
+      chatSignals: this.chatMemory.ideaSignals(),
       count: 3,
     });
     if (generated.candidates.length === 0) {
@@ -1267,6 +1746,21 @@ export class MomentsRuntime {
     }
     let chosen: IdeaCandidate | null = null;
     for (const candidate of generated.candidates) {
+      try {
+        this.chatMemory.assertNoLeak(`${candidate.topic}\n${candidate.motivation}\n${candidate.sourceEvidence}`, '选题');
+      } catch (error) {
+        this.deps.store.appendAudit({
+          at: this.iso(),
+          actor: 'scheduler',
+          action: 'idea_privacy_blocked',
+          taskId: null,
+          previousState: null,
+          nextState: null,
+          reason: error instanceof Error ? error.message : '候选主题疑似包含聊天隐私',
+          metadata: { sourceType: candidate.sourceType },
+        });
+        continue;
+      }
       const evaluation = this.decision.evaluateCandidate(candidate, context);
       if (evaluation.decision.allowed) {
         chosen = candidate;
@@ -1297,7 +1791,7 @@ export class MomentsRuntime {
       if (!reviewed.passed) {
         return { created: false, reason: `草稿审核未通过：${reviewed.notes[0] ?? ''}` };
       }
-      await this.requestApproval(taskId);
+      if (this.deps.config.publishMode === 'APPROVAL_REQUIRED') await this.requestApproval(taskId);
       return { created: true, reason: '已创作并提交审批', taskId };
     } catch (error) {
       this.deps.store.appendAudit({
@@ -1486,7 +1980,7 @@ export class MomentsRuntime {
     const schedule = async (): Promise<void> => {
       if (this.stopped) return;
       try {
-        expirePendingTasks(this.deps.store, this.now());
+        expirePendingTasks(this.deps.store, this.now(), undefined, this.deps.config.publishMode === 'APPROVAL_REQUIRED');
         await this.scanImageImports();
         const settings = this.scheduleView();
         if (!settings.scheduleEnabled) return;
@@ -1503,6 +1997,15 @@ export class MomentsRuntime {
     };
     this.commandTimerDisposer = this.setInterval(poll, this.deps.config.wechatAgent.pollIntervalMs);
     this.scheduleTimerDisposer = this.setInterval(schedule, Math.min(10, this.deps.config.scheduler.tickSeconds) * 1000);
+    // 拟人化自动发送独立 tick：默认关闭时立即返回，不读写数据库、不触达外部服务。
+    this.humanizeTimerDisposer = this.setInterval(async () => {
+      if (this.stopped) return;
+      try {
+        await this.humanizeScheduler.tick();
+      } catch (error) {
+        this.deps.logger.warn('拟人化自动发送 tick 失败', { error: redactSecrets(String(error)) });
+      }
+    }, Math.min(10, this.deps.config.scheduler.tickSeconds) * 1000);
     return { stop: () => this.stop() };
   }
 
@@ -1523,8 +2026,10 @@ export class MomentsRuntime {
     this.abort.abort();
     this.commandTimerDisposer?.();
     this.scheduleTimerDisposer?.();
+    this.humanizeTimerDisposer?.();
     this.commandTimerDisposer = null;
     this.scheduleTimerDisposer = null;
+    this.humanizeTimerDisposer = null;
   }
 
   async drain(): Promise<void> { await Promise.allSettled([...this.pending]); }

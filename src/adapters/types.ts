@@ -85,11 +85,29 @@ export interface WechatImagePayload {
   readonly bytes: Uint8Array;
 }
 
+/** Reader 会话（仅上游白名单内可见）。talker 是原始 ID，只用于本机同步。 */
+export interface WechatConversation {
+  readonly talker: string;
+  readonly kind: 'group' | 'private';
+  readonly displayName: string;
+}
+
+/** Reader 纯文本消息；已由适配器做基础清洗，未做隐私脱敏（由记忆层负责）。 */
+export interface WechatChatMessage {
+  readonly talker: string;
+  readonly messageId: string;
+  readonly sentAt: string;
+  readonly senderWxid: string;
+  readonly senderName: string;
+  readonly text: string;
+  readonly isSelf: boolean;
+}
+
 /**
  * WeChatAgent 适配器。
  *
  * 只依赖其公开文档化的本机接口：
- * - Reader API: /api/v1/reader/status、/api/v1/messages、/api/v1/images/<sha256>（Bearer token）
+ * - Reader API: /api/v1/reader/status、/api/v1/sessions、/api/v1/messages、/api/v1/images/<sha256>（Bearer token）
  * - Hook API: /WeChatAgent/health、/SendTextMsg（Bearer token + X-WeChatAgent-Account）
  * 不假设存在 sendImage / publishMoments 等未公开方法。
  */
@@ -100,6 +118,10 @@ export interface WeChatAgentAdapter {
   sendText(text: string, options?: { signal?: AbortSignal }): Promise<WechatSendResult>;
   listOwnerMessages(limit: number): Promise<OwnerMessage[]>;
   fetchImage(sha256: string): Promise<WechatImagePayload>;
+  /** 读取 Chat 范围白名单内的会话（含群聊/私聊），用于社交记忆同步。 */
+  listConversations(limit: number): Promise<WechatConversation[]>;
+  /** 读取单个会话的纯文本消息；上游会拒绝白名单外会话。 */
+  listConversationMessages(talker: string, limit: number): Promise<WechatChatMessage[]>;
 }
 
 // ---------------------------------------------------------------------------
@@ -153,6 +175,7 @@ export interface DesktopPrepareResult {
 }
 
 export interface DesktopPublishRequest {
+  readonly publishMode?: import('../domain/types.js').PublishMode;
   readonly taskId: string;
   readonly attemptId: string;
   readonly contentHash: string;

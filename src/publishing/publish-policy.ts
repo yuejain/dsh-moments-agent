@@ -3,8 +3,8 @@
  *
  * 状态机只保证流程合法；本策略保证：
  * - 默认 PREPARE_ONLY，绝不自动点击发表；
- * - 必须有与当前内容快照完全一致的有效审批；
- * - 必须确认桌面执行器允许发布、当前微信账号与审批账号一致；
+ * - 审批模式要求有效审批；直接模式要求内容与审核快照一致；
+ * - 必须确认桌面执行器允许发布、当前微信账号与任务绑定账号一致；
  * - 幂等键相同的内容不得重复发布。
  */
 import type {
@@ -32,7 +32,7 @@ export interface PublishPolicyContext {
   readonly now: Date;
 }
 
-/** POLICY_AUTONOMOUS 需要额外的部署级环境开关，避免仅改配置就放开自动发布。 */
+/** 旧版环境变量读取工具保留兼容；三级模式由所有者配置控制，不再隐式降级。 */
 export function autonomousPublishDeploymentAllowed(env: Readonly<Record<string, string | undefined>> = process.env): boolean {
   return env.DSH_MOMENTS_ALLOW_AUTONOMOUS_PUBLISH === '1';
 }
@@ -41,8 +41,8 @@ export function effectivePublishMode(
   config: MomentsConfig,
   env: Readonly<Record<string, string | undefined>> = process.env,
 ): PublishMode {
-  if (config.publishMode !== 'POLICY_AUTONOMOUS') return config.publishMode;
-  return autonomousPublishDeploymentAllowed(env) ? 'POLICY_AUTONOMOUS' : 'APPROVAL_REQUIRED';
+  // The owner-selected mode is authoritative; no hidden environment downgrade.
+  return config.publishMode;
 }
 
 export class PublishPolicy {
@@ -63,6 +63,13 @@ export class PublishPolicy {
     }
     if (context.duplicateContentHash) {
       return { code: 'DUPLICATE_PUBLISH', reason: '相同内容已经发布过，禁止重复发布' };
+    }
+    if (effectivePublishMode(context.config, this.env) !== 'APPROVAL_REQUIRED') {
+      if (context.task.contentHash !== context.snapshot.contentHash ||
+          context.task.assetManifestHash !== context.snapshot.assetManifestHash) {
+        return { code: 'CONTENT_CHANGED', reason: '内容与审核通过时的快照不一致，需重新审核' };
+      }
+      return null;
     }
     if (context.approval === null) {
       return { code: 'APPROVAL_REQUIRED', reason: '没有已批准的审批记录' };

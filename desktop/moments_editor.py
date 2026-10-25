@@ -2,7 +2,7 @@
 
 职责边界：
 - prepare：按协议 §3 的 1-12 步执行，任何一步失败立即停止，**绝不点击发表**；
-- publish：仅在 server 确认 ``--allow-publish`` + ``APPROVAL_REQUIRED`` 后调用，
+- publish：仅在 server 确认 ``--allow-publish`` + 第二或第三档 后调用，
   点击前重新读取编辑器内容比对，点击后核验；已点击但无法确认时返回 uncertain
   并禁止自动重试。
 
@@ -25,7 +25,6 @@ from .config import (
     WechatStatus,
     ensure_directory_under,
     normalize_path,
-    normalize_text,
     redact_meta,
     resolve_under,
     safe_filename_component,
@@ -169,7 +168,7 @@ class MomentsEditor:
             self._guard.ensure_prepare_ready(
                 status,
                 account_id,
-                uia_available=self._driver.uia_available,
+                uia_available=self._uia_requirement(),
             )
             self._check_cancel(cancel_event)
             self._log("开始准备朋友圈内容", attemptId=attempt_id, taskId=task_id, images=len(asset_paths))
@@ -192,7 +191,7 @@ class MomentsEditor:
 
             # 9. 读回正文与图片数量
             read_text, read_image_count = self._driver.read_back(timeout=self._config.prepare_timeout)
-            text_matched = normalize_text(read_text) == normalize_text(text)
+            text_matched = self._driver.matches_expected_text(read_text, text)
             image_count = int(read_image_count)
             if not text_matched:
                 raise ExecutorError("CONTENT_CHANGED", "编辑器读回的正文与审批内容不一致，已停止操作")
@@ -274,14 +273,27 @@ class MomentsEditor:
     ) -> PublishOutcome:
         """在服务端已确认发布权限后执行：复检 → 点击 → 核验。"""
         # 防御性双保险：即使调用方误用，也绝不在未授权时点击发表。
-        if not allow_publish or self._config.mode != "APPROVAL_REQUIRED" or not self._config.allow_publish:
+        if not allow_publish or not self._config.effective_allow_publish:
             return PublishOutcome(
                 ok=False,
                 submitted=False,
                 verified=False,
                 uncertain=False,
                 error_code="PUBLISH_MODE_DISABLED",
-                message="未开启发表权限（需要 --allow-publish 且 mode=APPROVAL_REQUIRED），未点击发表",
+                message="未开启发表权限（需要 --allow-publish 且 mode 为 APPROVAL_REQUIRED 或 POLICY_AUTONOMOUS），未点击发表",
+            )
+        # 几何驱动必须额外显式 --geometry-allow-publish；绝不因驱动类型放大权限。
+        if (
+            getattr(self._driver, "driver_kind", "uia") == "geometry"
+            and not getattr(self._config, "effective_geometry_publish", False)
+        ):
+            return PublishOutcome(
+                ok=False,
+                submitted=False,
+                verified=False,
+                uncertain=False,
+                error_code="PUBLISH_MODE_DISABLED",
+                message="几何驱动未开启发表权限（需要 --geometry-allow-publish 且 --allow-publish + 第二或第三档），未点击发表",
             )
         attempt_id = snapshot.attempt_id
         if self._check_cancelled(cancel_event):
@@ -295,7 +307,7 @@ class MomentsEditor:
             requested_hash = str(request.get("contentHash", ""))
             requested_account = str(request.get("accountId", ""))
             approval_id = str(request.get("approvalId", ""))
-            if not approval_id:
+            if self._config.mode == "APPROVAL_REQUIRED" and not approval_id:
                 return PublishOutcome(
                     ok=False,
                     submitted=False,
@@ -322,7 +334,7 @@ class MomentsEditor:
             self._guard.ensure_publish_ready(
                 status,
                 snapshot.account_id,
-                uia_available=self._driver.uia_available,
+                uia_available=self._uia_requirement(),
             )
             if self._check_cancelled(cancel_event):
                 return PublishOutcome(
@@ -334,7 +346,7 @@ class MomentsEditor:
 
             # 点击前重新读取编辑器正文与图片数量，与 prepare 快照比对。
             current_text, current_images = self._driver.read_back(timeout=self._config.prepare_timeout)
-            if normalize_text(current_text) != normalize_text(snapshot.text):
+            if not self._driver.matches_expected_text(current_text, snapshot.text):
                 return PublishOutcome(
                     ok=False,
                     submitted=False,
@@ -423,6 +435,12 @@ class MomentsEditor:
 
     def _status(self) -> WechatStatus:
         return self._driver.get_status(timeout=self._config.status_timeout)
+
+    def _uia_requirement(self) -> bool:
+        """UIA 依赖检查值：几何驱动不要求 UIA，其余驱动沿用真实可用性。"""
+        if not getattr(self._driver, "requires_uia", True):
+            return True
+        return bool(self._driver.uia_available)
 
     def _uncertain_after_click(
         self,

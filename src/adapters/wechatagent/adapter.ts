@@ -15,7 +15,15 @@
 import { readFile } from 'node:fs/promises';
 import { MomentsError, isMomentsError } from '../../domain/result.js';
 import type { AdapterHealth } from '../../domain/types.js';
-import type { FetchLike, OwnerMessage, WeChatAgentAdapter, WechatImagePayload, WechatSendResult } from '../types.js';
+import type {
+  FetchLike,
+  OwnerMessage,
+  WeChatAgentAdapter,
+  WechatChatMessage,
+  WechatConversation,
+  WechatImagePayload,
+  WechatSendResult,
+} from '../types.js';
 import type { WeChatAgentConfig } from '../../config.js';
 import { maskWxid } from '../../security/redaction.js';
 
@@ -46,10 +54,18 @@ interface RawMessageRow {
   createTime?: number | string;
   isSend?: boolean;
   senderUsername?: string;
+  senderDisplay?: string;
   fullText?: string;
   content?: string;
   parsedContent?: string;
   localType?: number;
+}
+
+interface RawSessionRow {
+  username?: string;
+  displayName?: string;
+  conversationId?: string;
+  type?: number;
 }
 
 export class WeChatAgentHttpAdapter implements WeChatAgentAdapter {
@@ -341,6 +357,74 @@ export class WeChatAgentHttpAdapter implements WeChatAgentAdapter {
         };
       })
       .filter((message) => message.text.trim() !== '');
+  }
+
+  /**
+   * 读取白名单内的会话列表（Reader /api/v1/sessions）。
+   * 上游只返回“聊天范围”内允许的会话；本方法不做额外放宽。
+   */
+  async listConversations(limit: number): Promise<WechatConversation[]> {
+    if (!this.config.enabled) return [];
+    const { baseUrl, token } = await this.readerEndpoint();
+    const capped = Math.min(Math.max(limit, 1), 200);
+    const payload = await this.requestJson<{ sessions?: RawSessionRow[] }>(
+      `${baseUrl}/api/v1/sessions?limit=${capped}`,
+      { method: 'GET', headers: { Authorization: `Bearer ${token}` } },
+      this.config.requestTimeoutMs,
+    );
+    const rows = Array.isArray(payload.sessions) ? payload.sessions : [];
+    const seen = new Set<string>();
+    const conversations: WechatConversation[] = [];
+    for (const row of rows) {
+      const talker = typeof row.username === 'string' ? row.username : '';
+      if (talker === '' || seen.has(talker)) continue;
+      // 与所有者自己的单聊不属于“社交观察”范围。
+      if (this.config.ownerWxid !== '' && talker === this.config.ownerWxid) continue;
+      seen.add(talker);
+      conversations.push({
+        talker,
+        kind: row.type === 1 || talker.includes('@chatroom') ? 'group' : 'private',
+        displayName: typeof row.displayName === 'string' ? row.displayName.trim() : '',
+      });
+      if (conversations.length >= capped) break;
+    }
+    return conversations;
+  }
+
+  /**
+   * 读取单个会话的纯文本消息（Reader /api/v1/messages）。
+   * 白名单由上游强制；非文本消息（图片/文件/语音/表情）不进入记忆。
+   */
+  async listConversationMessages(talker: string, limit: number): Promise<WechatChatMessage[]> {
+    if (!this.config.enabled || talker === '') return [];
+    const { baseUrl, token } = await this.readerEndpoint();
+    const capped = Math.min(Math.max(limit, 1), 500);
+    const payload = await this.requestJson<{ messages?: RawMessageRow[] }>(
+      `${baseUrl}/api/v1/messages?talker=${encodeURIComponent(talker)}&limit=${capped}`,
+      { method: 'GET', headers: { Authorization: `Bearer ${token}` } },
+      this.config.requestTimeoutMs,
+    );
+    const rows = Array.isArray(payload.messages) ? payload.messages : [];
+    const messages: WechatChatMessage[] = [];
+    for (const row of rows) {
+      if (row.localType !== 1) continue;
+      const text = String(row.fullText ?? row.content ?? row.parsedContent ?? '').trim();
+      if (text === '') continue;
+      const createTime = Number(row.createTime);
+      if (!Number.isFinite(createTime) || createTime <= 0) continue;
+      const localId = row.localId === undefined ? '' : String(row.localId);
+      const serverId = row.serverId === undefined ? '' : String(row.serverId);
+      messages.push({
+        talker,
+        messageId: `${localId}:${createTime}:${serverId}`,
+        sentAt: new Date(createTime * 1000).toISOString(),
+        senderWxid: typeof row.senderUsername === 'string' ? row.senderUsername : '',
+        senderName: typeof row.senderDisplay === 'string' ? row.senderDisplay.trim() : '',
+        text,
+        isSelf: row.isSend === true,
+      });
+    }
+    return messages;
   }
 
   async fetchImage(sha256: string): Promise<WechatImagePayload> {

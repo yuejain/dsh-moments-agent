@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "baseUrl": "http://127.0.0.1:18766",
+  "tokenFile": "data/admin-token.txt",
+  "dataDir": "data",
+  "_comment": "复制为 client/moments-client.json 后按需修改。本文件不保存管理令牌；令牌只从 tokenFile 指向的文件读取。"
+}

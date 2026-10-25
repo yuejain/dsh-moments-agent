@@ -206,3 +206,117 @@ test('桌面执行器客户端：健康、准备与协议错误码映射', async
   // 令牌从请求头读取，不进入 URL
   assert.equal(calls.every((call) => !call.url.includes('d'.repeat(32))), true);
 });
+
+test('WeChatAgent 适配器：会话列表只保留白名单返回，过滤掉所有者单聊', async () => {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push({ url, headers: init.headers });
+    if (url.includes('/api/v1/sessions')) {
+      return jsonResponse({
+        success: true,
+        sessions: [
+          { username: '123456@chatroom', displayName: '示例群', type: 1 },
+          { username: 'wxid_friend_a', displayName: '联系人A', type: 0 },
+          { username: 'wxid_owner', displayName: '我自己', type: 0 },
+        ],
+      });
+    }
+    return jsonResponse({ success: false }, 404);
+  };
+  const adapter = new WeChatAgentHttpAdapter({
+    config: config(),
+    fetchImpl,
+    env: { DSH_MOMENTS_READER_TOKEN: 'r'.repeat(32), DSH_MOMENTS_HOOK_TOKEN: 'h'.repeat(32) },
+  });
+  const conversations = await adapter.listConversations(20);
+  assert.equal(conversations.length, 2);
+  assert.deepEqual(conversations[0], { talker: '123456@chatroom', kind: 'group', displayName: '示例群' });
+  assert.deepEqual(conversations[1], { talker: 'wxid_friend_a', kind: 'private', displayName: '联系人A' });
+  assert.equal(calls[0].url.includes('limit=20'), true);
+  assert.equal(String(calls[0].headers.Authorization).startsWith('Bearer '), true);
+});
+
+test('WeChatAgent 适配器：只读取纯文本消息并保留发送者信息', async () => {
+  const calls = [];
+  const fetchImpl = async (url) => {
+    calls.push(url);
+    if (url.includes('/api/v1/messages')) {
+      return jsonResponse({
+        success: true,
+        messages: [
+          {
+            localId: 101,
+            serverId: '9001',
+            createTime: 1_790_000_000,
+            isSend: false,
+            localType: 1,
+            senderUsername: 'wxid_member_a',
+            senderDisplay: '示例成员甲',
+            fullText: '今天猫又把杯子推下去了',
+          },
+          {
+            localId: 102,
+            serverId: '9002',
+            createTime: 1_790_000_060,
+            isSend: true,
+            localType: 1,
+            senderUsername: 'wxid_owner',
+            senderDisplay: '我',
+            fullText: '真的假的',
+          },
+          {
+            localId: 103,
+            serverId: '9003',
+            createTime: 1_790_000_120,
+            isSend: false,
+            localType: 3,
+            senderUsername: 'wxid_member_a',
+            senderDisplay: '示例成员甲',
+            fullText: '',
+          },
+          {
+            localId: 104,
+            serverId: '9004',
+            createTime: 1_790_000_180,
+            isSend: false,
+            localType: 1,
+            senderUsername: 'wxid_member_b',
+            senderDisplay: '示例成员乙',
+            fullText: '   ',
+          },
+        ],
+      });
+    }
+    return jsonResponse({ success: false }, 404);
+  };
+  const adapter = new WeChatAgentHttpAdapter({
+    config: config(),
+    fetchImpl,
+    env: { DSH_MOMENTS_READER_TOKEN: 'r'.repeat(32), DSH_MOMENTS_HOOK_TOKEN: 'h'.repeat(32) },
+  });
+  const messages = await adapter.listConversationMessages('123456@chatroom', 50);
+  assert.equal(messages.length, 2);
+  assert.equal(messages[0].text, '今天猫又把杯子推下去了');
+  assert.equal(messages[0].senderName, '示例成员甲');
+  assert.equal(messages[0].isSelf, false);
+  assert.equal(messages[0].messageId, '101:1790000000:9001');
+  assert.equal(messages[0].sentAt, new Date(1_790_000_000 * 1000).toISOString());
+  assert.equal(messages[1].isSelf, true);
+  assert.equal(calls[0].includes('talker=123456%40chatroom'), true);
+  assert.equal(calls[0].includes('limit=50'), true);
+});
+
+test('WeChatAgent 适配器：未启用时不发起会话读取请求', async () => {
+  let called = 0;
+  const adapter = new WeChatAgentHttpAdapter({
+    config: config({ enabled: false }),
+    fetchImpl: async () => {
+      called += 1;
+      return jsonResponse({});
+    },
+    env: { DSH_MOMENTS_READER_TOKEN: 'r'.repeat(32) },
+  });
+  assert.deepEqual(await adapter.listConversations(10), []);
+  assert.deepEqual(await adapter.listConversationMessages('123@chatroom', 10), []);
+  assert.equal(called, 0);
+});

@@ -1,5 +1,45 @@
-# Windows 桌面执行器核心与测试仅需 Python 标准库。
-# 真实 UI Automation 可选依赖（仍需对目标微信版本实机验收）：
-# pywinauto>=0.6.9
-# comtypes>=1.2.0
-# 缺少依赖时 GUI 操作返回 DESKTOP_UNSUPPORTED。
+# Windows 桌面执行器 Python 依赖说明
+#
+# 核心实现只使用 Python 标准库：
+#   http.server / threading / ctypes / winreg / zlib / struct / json / unittest
+# 因此本文件默认不需要安装任何第三方包；全部单元测试可在系统 Python 3.11 下运行。
+#
+# ---------------------------------------------------------------------------
+# 可选依赖 1：微信 UIA 驱动（RealWechatDriver，默认驱动）
+# ---------------------------------------------------------------------------
+#   pywinauto>=0.6.9
+#   comtypes>=1.2.0
+# 说明：
+# - 缺失时 RealWechatDriver 惰性导入失败，uiaAvailable=false，GUI 操作返回
+#   DESKTOP_UNSUPPORTED，不会在 import 阶段崩溃；
+# - 本仓库桌面端可选 wheel 已放在 desktop/.vendor（pywin32/pywinauto/comtypes），
+#   供 DSH Python 3.12 使用；系统 Python 3.11 不要安装 cp312 wheel。
+#
+# ---------------------------------------------------------------------------
+# 可选依赖 2：微信 4.x 几何驱动的 OCR 核验（GeometryWechatDriver）
+# ---------------------------------------------------------------------------
+# 首选（中文准确率显著高于 Windows OCR）：
+#   rapidocr_onnxruntime==1.4.4（含 onnxruntime/opencv/Pillow/numpy，体积较大）
+# 回退：
+#   winsdk==1.0.0b10 + 系统中文 OCR 语言包
+# 说明：
+# - OCR 通过独立 helper `desktop/ocr/win_helper.py` 子进程调用；
+#   helper 优先 RapidOCR，失败回退 Windows.Media.Ocr；
+# - helper 必须由 DSH Python 3.12 执行，并把 `desktop/.vendor` 加入 PYTHONPATH
+#   （WindowsOcrProvider 会自动设置）；
+# - 实测 RapidOCR 对编辑器截图识别准确率显著优于 winsdk（见 VERIFICATION_ROUND5）；
+# - 默认自动探测 DSH Python：
+#     D:\dsh\resources\runtime\primary-runtime\dependencies\python\python.exe
+#   也可用 --ocr-python 显式指定；
+# - 缺少 RapidOCR/winsdk/OCR 语言时返回 OCR_UNAVAILABLE，几何驱动的
+#   prepare/publish/delete 会失败，绝不伪造 OCR 成功；
+# - 系统 Python 3.11 不安装这些 cp312 wheel，不影响任何单元测试。
+#
+# ---------------------------------------------------------------------------
+# 真实发布 NOT_TESTED
+# ---------------------------------------------------------------------------
+# - 微信 4.1.10.27 几何流程已在第四轮做过一次性人工验证（见
+#   docs/audit/VERIFICATION_ROUND4.md），但执行器正式集成后的真实发布/删除
+#   仍为 NOT_TESTED，必须由所有者显式审批并人工核对；
+# - 不要为了“让发布跑通”而跳过 OCR/按钮检测/审批校验；缺失证据时应返回
+#   uncertain 或明确错误码。

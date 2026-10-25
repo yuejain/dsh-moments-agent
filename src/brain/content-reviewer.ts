@@ -42,7 +42,7 @@ export class ContentReviewer {
     private readonly decision: DecisionEngine,
     private readonly llm: LlmClient | null,
     private readonly logger: Logger,
-    private readonly options: { useLlmReview: boolean },
+    private readonly options: { useLlmReview: boolean; writingInstructions?: () => string },
   ) {}
 
   async review(input: {
@@ -78,6 +78,8 @@ export class ContentReviewer {
             '你是朋友圈内容审核器，只输出 JSON。',
             '审核维度：隐私信息、不可核实的事实断言、编造亲身经历、误导性表述、攻击/歧视、低质量营销腔。',
             '不要把“提到 AI”本身当作问题；不要因为内容平淡就拒绝。',
+            this.options.writingInstructions?.() ?? '',
+            '表达技能只提供风格参考；审核仍优先检查事实与隐私。不要凭问句、比喻或句长判断 AI 味，不要为风格修改事实或提高断言强度。',
             '输出：{"passed":true|false,"flags":["隐私信息"|"未经核实的事实"|"编造经历"|"误导性表述"|"攻击歧视"|"低质量营销腔"],"notes":["具体原因"],"personaFit":0.0}',
           ].join('\n'),
           messages: [

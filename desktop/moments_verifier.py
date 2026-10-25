@@ -19,7 +19,6 @@ from .config import (
     Verification,
     ensure_directory_under,
     normalize_path,
-    normalize_text,
     redact_meta,
     resolve_under,
     safe_filename_component,
@@ -114,7 +113,7 @@ class MomentsVerifier:
             if verification.visible_text is None:
                 verified = False
                 notes.append("驱动声称核验成功，但没有返回可见正文证据")
-            elif normalize_text(verification.visible_text) != normalize_text(expected_text):
+            elif not self._driver.matches_verified_text(verification.visible_text, expected_text):
                 verified = False
                 notes.append("朋友圈可见正文与预期不一致")
             if verification.image_count is None:

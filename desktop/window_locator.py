@@ -136,11 +136,21 @@ if _IS_WINDOWS and _user32 is not None and _kernel32 is not None and _gdi32 is n
         _user32.PrintWindow.restype = ctypes.c_bool
         _user32.GetWindowDC.argtypes = [ctypes.c_void_p]
         _user32.GetWindowDC.restype = ctypes.c_void_p
+        _user32.GetDC.argtypes = [ctypes.c_void_p]
+        _user32.GetDC.restype = ctypes.c_void_p
         _user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         _user32.ReleaseDC.restype = ctypes.c_int
+        _user32.GetForegroundWindow.argtypes = []
+        _user32.GetForegroundWindow.restype = ctypes.c_void_p
         if hasattr(_user32, "GetDpiForWindow"):
             _user32.GetDpiForWindow.argtypes = [ctypes.c_void_p]
             _user32.GetDpiForWindow.restype = ctypes.c_uint
+        if hasattr(_user32, "SetProcessDpiAwarenessContext"):
+            _user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+            _user32.SetProcessDpiAwarenessContext.restype = ctypes.c_bool
+        if hasattr(_user32, "SetProcessDPIAware"):
+            _user32.SetProcessDPIAware.argtypes = []
+            _user32.SetProcessDPIAware.restype = ctypes.c_bool
 
         _kernel32.CreateToolhelp32Snapshot.argtypes = [ctypes.c_ulong, ctypes.c_ulong]
         _kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
@@ -164,6 +174,18 @@ if _IS_WINDOWS and _user32 is not None and _kernel32 is not None and _gdi32 is n
 
         _gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
         _gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
+        _gdi32.BitBlt.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint,
+        ]
+        _gdi32.BitBlt.restype = ctypes.c_bool
         _gdi32.CreateCompatibleBitmap.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
         _gdi32.CreateCompatibleBitmap.restype = ctypes.c_void_p
         _gdi32.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
@@ -184,6 +206,203 @@ if _IS_WINDOWS and _user32 is not None and _kernel32 is not None and _gdi32 is n
         _gdi32.DeleteDC.restype = ctypes.c_bool
     except Exception:  # pragma: no cover - 仅防御异常 ctypes 绑定
         _IS_WINDOWS = False
+        _user32 = _kernel32 = _gdi32 = None
+
+
+# ---------------------------------------------------------------------------
+# 进程级 DPI 感知（鼠标/窗口/截图统一使用物理像素）
+# ---------------------------------------------------------------------------
+
+_SRCCOPY = 0x00CC0020
+_DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+_TOKEN_QUERY = 0x0008
+_TOKEN_ELEVATION = 20
+_dpi_awareness: str | None = None
+
+
+def ensure_dpi_aware() -> str:
+    """把当前进程设为 Per-Monitor-V2 DPI 感知（幂等，返回生效的模式）。
+
+    微信 4.x 的 Qt 界面按物理像素布局，几何 profile 坐标也是物理像素；
+    如果进程是 DPI 未感知的（例如直接 `python desktop/server.py`），
+    GetWindowRect / SetCursorPos 会被系统按缩放比例二次换算，导致点错位置。
+    打包的 EXE 已在 manifest 声明 PerMonitorV2，这里再做一次运行期兜底。
+    """
+    global _dpi_awareness
+    if _dpi_awareness is not None:
+        return _dpi_awareness
+    if not _IS_WINDOWS or _user32 is None:  # pragma: no cover - 非 Windows
+        _dpi_awareness = "unsupported"
+        return _dpi_awareness
+    try:
+        if hasattr(_user32, "SetProcessDpiAwarenessContext") and _user32.SetProcessDpiAwarenessContext(
+            ctypes.c_void_p(_DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+        ):
+            _dpi_awareness = "per-monitor-v2"
+            return _dpi_awareness
+    except (OSError, AttributeError):  # pragma: no cover - 旧系统
+        pass
+    try:
+        if hasattr(_user32, "SetProcessDPIAware") and _user32.SetProcessDPIAware():
+            _dpi_awareness = "system-aware"
+            return _dpi_awareness
+    except (OSError, AttributeError):  # pragma: no cover
+        pass
+    try:  # pragma: no cover - Win8.1 回退
+        _shcore = ctypes.WinDLL("shcore", use_last_error=True)
+        if _shcore.SetProcessDpiAwareness(2) == 0:
+            _dpi_awareness = "per-monitor"
+            return _dpi_awareness
+    except (OSError, AttributeError):  # pragma: no cover
+        pass
+    _dpi_awareness = "unknown"
+    return _dpi_awareness
+
+
+def dpi_awareness() -> str | None:
+    """已生效的 DPI 感知模式（未调用 ensure_dpi_aware 时为 None）。"""
+    return _dpi_awareness
+
+
+def foreground_window() -> int | None:
+    """当前前台顶层窗口句柄（非 Windows 返回 None）。"""
+    if not _IS_WINDOWS or _user32 is None:
+        return None
+    try:
+        handle = _user32.GetForegroundWindow()
+    except OSError:  # pragma: no cover
+        return None
+    return int(handle) if handle else None
+
+
+def window_process_id(hwnd: int) -> int | None:
+    """窗口所属进程 PID；读不到返回 None。"""
+    if not _IS_WINDOWS or _user32 is None:
+        return None
+    try:
+        pid = ctypes.c_ulong(0)
+        _user32.GetWindowThreadProcessId(ctypes.c_void_p(int(hwnd)), ctypes.byref(pid))
+    except OSError:  # pragma: no cover
+        return None
+    return int(pid.value) or None
+
+
+def process_is_elevated(pid: int) -> bool | None:
+    """目标进程是否以管理员（高完整性）运行。
+
+    返回 True/False；无法查询（权限不足/进程已退出）返回 None，调用方必须把
+    None 当作“无法确认”，不能当作未提权。
+    """
+    if not _IS_WINDOWS or _kernel32 is None:  # pragma: no cover - 非 Windows
+        return None
+    handle = None
+    token = None
+    try:
+        handle = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            return None
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        token = ctypes.c_void_p()
+        if not advapi32.OpenProcessToken(ctypes.c_void_p(handle), _TOKEN_QUERY, ctypes.byref(token)):
+            return None
+        info = ctypes.c_int(0)
+        returned = ctypes.c_ulong(0)
+        if not advapi32.GetTokenInformation(
+            token,
+            _TOKEN_ELEVATION,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+            ctypes.byref(returned),
+        ):
+            return None
+        return bool(info.value)
+    except OSError:  # pragma: no cover
+        return None
+    finally:
+        try:
+            if token:
+                _kernel32.CloseHandle(token)
+            if handle:
+                _kernel32.CloseHandle(ctypes.c_void_p(handle))
+        except OSError:  # pragma: no cover
+            pass
+
+
+def capture_screen_rgb(
+    left: int,
+    top: int,
+    width: int,
+    height: int,
+    *,
+    timeout: float = 10.0,
+) -> tuple[int, int, list[bytes]]:
+    """从桌面屏幕捕获指定矩形，返回 ``(width, height, rgb_rows)``。
+
+    与 PrintWindow 不同，屏幕捕获会包含独立的弹出窗口（右键菜单、朋友圈编辑器
+    气泡等）。调用方必须保证目标窗口在前台且未被遮挡；失败抛 ExecutorError。
+    """
+    if not _IS_WINDOWS or _user32 is None or _gdi32 is None:  # pragma: no cover - 非 Windows
+        raise ExecutorError("DESKTOP_UNSUPPORTED", "当前环境不支持屏幕捕获（非 Windows）")
+    width = int(width)
+    height = int(height)
+    if width <= 0 or height <= 0:
+        raise ExecutorError("WINDOW_BLOCKED", "屏幕捕获区域尺寸为 0，已停止操作")
+    started = time.monotonic()
+    screen_dc = _user32.GetDC(None)
+    if not screen_dc:
+        raise ExecutorError("WINDOW_NOT_FOUND", "无法获取屏幕设备上下文，屏幕捕获失败")
+    memory_dc = 0
+    bitmap = 0
+    old_object = 0
+    try:
+        memory_dc = _gdi32.CreateCompatibleDC(screen_dc)
+        if not memory_dc:
+            raise ExecutorError("WINDOW_NOT_FOUND", "无法创建屏幕捕获缓冲区")
+        bitmap = _gdi32.CreateCompatibleBitmap(screen_dc, width, height)
+        if not bitmap:
+            raise ExecutorError("WINDOW_NOT_FOUND", "无法创建屏幕捕获位图")
+        old_object = _gdi32.SelectObject(memory_dc, bitmap)
+        if not _gdi32.BitBlt(memory_dc, 0, 0, width, height, screen_dc, int(left), int(top), _SRCCOPY):
+            raise ExecutorError("WINDOW_NOT_FOUND", "屏幕区域拷贝失败（窗口可能已被遮挡或移出屏幕）")
+
+        buffer_size = width * height * 4
+        raw = (ctypes.c_ubyte * buffer_size)()
+        info = _BITMAPINFO()
+        info.bmiHeader.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
+        info.bmiHeader.biWidth = width
+        info.bmiHeader.biHeight = -height
+        info.bmiHeader.biPlanes = 1
+        info.bmiHeader.biBitCount = 32
+        info.bmiHeader.biCompression = 0
+        scanned = _gdi32.GetDIBits(
+            memory_dc, bitmap, 0, height, ctypes.byref(raw), ctypes.byref(info), _DIB_RGB_COLORS
+        )
+        if scanned == 0:
+            raise ExecutorError("WINDOW_NOT_FOUND", "读取屏幕像素失败")
+        rows: list[bytes] = []
+        for row_index in range(height):
+            start = row_index * width * 4
+            row = bytes(raw[start : start + width * 4])
+            rgb = bytearray(width * 3)
+            rgb[0::3] = row[2::4]
+            rgb[1::3] = row[1::4]
+            rgb[2::3] = row[0::4]
+            rows.append(bytes(rgb))
+        if time.monotonic() - started > timeout:
+            raise ExecutorError("WINDOW_NOT_FOUND", "屏幕捕获超时，已停止操作")
+        return width, height, rows
+    finally:
+        try:
+            if old_object:
+                _gdi32.SelectObject(memory_dc, old_object)
+            if bitmap:
+                _gdi32.DeleteObject(bitmap)
+            if memory_dc:
+                _gdi32.DeleteDC(memory_dc)
+            _user32.ReleaseDC(None, screen_dc)
+        except OSError:  # pragma: no cover
+            pass
+
 
 
 # ---------------------------------------------------------------------------
@@ -708,9 +927,15 @@ class WindowLocator:
 
     # -- 截图 -------------------------------------------------------------
 
-    def capture_window_png(self, hwnd: int, dest_path: str, *, timeout: float = 10.0) -> str:
-        """用 PrintWindow 截取窗口并编码为 PNG；失败抛 ExecutorError。"""
-        target = normalize_path(dest_path)
+    def capture_window_rgb(
+        self, hwnd: int, *, timeout: float = 10.0
+    ) -> tuple[int, int, list[bytes]]:
+        """用 PrintWindow + GetDIBits 截取窗口，返回 ``(width, height, rgb_rows)``。
+
+        - ``rgb_rows`` 是自上而下的 RGB 行，每行 ``width * 3`` 字节；
+        - 纯 Python 标准库（ctypes + GDI），不依赖 Pillow；
+        - 失败抛 ``ExecutorError``，不返回伪造画面。
+        """
         started = time.monotonic()
         if not _IS_WINDOWS or _user32 is None or _gdi32 is None:
             raise ExecutorError("DESKTOP_UNSUPPORTED", "当前环境不支持窗口截图（非 Windows）")
@@ -758,7 +983,7 @@ class WindowLocator:
             )
             if scanned == 0:
                 raise ExecutorError("WINDOW_NOT_FOUND", "读取窗口像素失败")
-            rows = []
+            rows: list[bytes] = []
             for row_index in range(height):
                 start = row_index * width * 4
                 row = bytes(raw[start : start + width * 4])
@@ -769,16 +994,7 @@ class WindowLocator:
                 rows.append(bytes(rgb))
             if time.monotonic() - started > timeout:
                 raise ExecutorError("WINDOW_NOT_FOUND", "截图超时，已停止操作")
-            png = encode_png_rgb(width, height, rows)
-            parent = os.path.dirname(target)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            with open(target, "wb") as handle:
-                handle.write(png)
-        except ExecutorError:
-            raise
-        except OSError as exc:
-            raise ExecutorError("INTERNAL_ERROR", f"写入截图失败：{exc}") from exc
+            return width, height, rows
         finally:
             try:
                 if old_object:
@@ -790,9 +1006,64 @@ class WindowLocator:
                 _user32.ReleaseDC(hwnd, window_dc)  # type: ignore[union-attr]
             except OSError:  # pragma: no cover
                 pass
+
+    def capture_window_png(self, hwnd: int, dest_path: str, *, timeout: float = 10.0) -> str:
+        """用 PrintWindow 截取窗口并编码为 PNG；复用 ``capture_window_rgb``。"""
+        target = normalize_path(dest_path)
+        width, height, rows = self.capture_window_rgb(hwnd, timeout=timeout)
+        png = encode_png_rgb(width, height, rows)
+        parent = os.path.dirname(target)
+        try:
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(target, "wb") as handle:
+                handle.write(png)
+        except OSError as exc:
+            raise ExecutorError("INTERNAL_ERROR", f"写入截图失败：{exc}") from exc
         if not os.path.isfile(target):
             raise ExecutorError("INTERNAL_ERROR", "截图文件未生成")
         return target
+
+    # -- 屏幕捕获（含独立弹出窗口） ---------------------------------------
+
+    def foreground_belongs_to_process(self, pid: int | None) -> bool:
+        """前台窗口是否属于指定进程（编辑器/右键菜单是独立顶层窗口）。"""
+        if pid is None:
+            return False
+        handle = foreground_window()
+        if not handle:
+            return False
+        return window_process_id(handle) == int(pid)
+
+    def capture_screen_rgb(
+        self,
+        window: WindowInfo,
+        *,
+        timeout: float = 10.0,
+    ) -> tuple[int, int, list[bytes]]:
+        """捕获窗口在屏幕上的矩形区域（物理像素，包含独立弹出窗口）。"""
+        if window is None or window.rect is None:
+            raise ExecutorError("WINDOW_NOT_FOUND", "微信窗口未定位，无法屏幕捕获")
+        left, top, right, bottom = window.rect
+        return capture_screen_rgb(left, top, right - left, bottom - top, timeout=timeout)
+
+    def capture_screen_png(self, window: WindowInfo, dest_path: str, *, timeout: float = 10.0) -> str:
+        """屏幕捕获窗口区域并编码为 PNG。"""
+        target = normalize_path(dest_path)
+        width, height, rows = self.capture_screen_rgb(window, timeout=timeout)
+        png = encode_png_rgb(width, height, rows)
+        parent = os.path.dirname(target)
+        try:
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(target, "wb") as handle:
+                handle.write(png)
+        except OSError as exc:
+            raise ExecutorError("INTERNAL_ERROR", f"写入截图失败：{exc}") from exc
+        if not os.path.isfile(target):
+            raise ExecutorError("INTERNAL_ERROR", "截图文件未生成")
+        return target
+
 
 
 # ---------------------------------------------------------------------------

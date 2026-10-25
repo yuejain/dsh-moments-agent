@@ -243,6 +243,70 @@ export class MockImageFacade {
   }
 }
 
+/** WeChatAgent 替身：只覆盖社交记忆同步用到的 Reader 方法。 */
+export class MockWechat {
+  constructor({
+    accountId = 'wxid_test',
+    ownWxid = 'wxid_owner',
+    conversations = [],
+    messages = {},
+  } = {}) {
+    this.accountId = accountId;
+    this.ownWxid = ownWxid;
+    this.conversations = conversations;
+    this.messages = messages;
+    this.calls = [];
+    this.failConversations = false;
+    this.failMessages = null;
+  }
+
+  async checkHealth() {
+    return { status: 'ok', message: 'Mock WeChatAgent 可用' };
+  }
+
+  async getAccount() {
+    return { accountId: this.accountId, ownWxid: this.ownWxid };
+  }
+
+  async sendText(text) {
+    this.calls.push({ method: 'sendText', text });
+    return { delivered: true, messageId: `mock-wechat-${this.calls.length}` };
+  }
+
+  async listOwnerMessages() {
+    return [];
+  }
+
+  async fetchImage() {
+    throw new Error('MockWechat 不支持图片');
+  }
+
+  async listConversations(limit) {
+    this.calls.push({ method: 'listConversations', limit });
+    if (this.failConversations) throw new Error('mock conversations failure');
+    return this.conversations.slice(0, limit);
+  }
+
+  async listConversationMessages(talker, limit) {
+    this.calls.push({ method: 'listConversationMessages', talker, limit });
+    if (this.failMessages !== null && this.failMessages === talker) throw new Error('mock messages failure');
+    return (this.messages[talker] ?? []).slice(-limit);
+  }
+}
+
+/** 构造一条 Reader 纯文本消息（时间使用相对现在，保证在保留期内）。 */
+export function chatMessage({ talker = 'group_a', senderWxid, senderName, text, minutesAgo = 0, isSelf = false }) {
+  return {
+    talker,
+    messageId: `msg-${senderWxid}-${minutesAgo}-${Math.random().toString(16).slice(2, 8)}`,
+    sentAt: new Date(Date.now() - minutesAgo * 60_000).toISOString(),
+    senderWxid,
+    senderName,
+    text,
+    isSelf,
+  };
+}
+
 export function makeConfig(overrides = {}) {
   const base = {
     enabled: true,

@@ -7,7 +7,10 @@ D:\dsh\resources\runtime\primary-runtime\dependencies\python\python.exe -m unitt
 
 - `test_api_client.py`：API 客户端与错误映射（使用 `fake_admin_server.py` 的 127.0.0.1 随机端口假服务）；
 - `test_config.py`：配置读写与“令牌绝不落盘”约束；
-- 全部测试不访问外网、不依赖真实插件、不使用真实令牌（假服务令牌运行时随机生成）。
+- `test_discovery.py`：本机路径/服务探测与受限 YAML 读取；
+- `test_auto_configure.py`：自动配置核心（profile 选择、配置块渲染/合并、备份与原子写、幂等、Reader 探测注入、脱敏、CLI）；
+- `test_web_server.py`：本地 Web 服务（自动配置端点、鉴权、静态文件与代理）；
+- 全部测试不访问外网、不依赖真实插件、不使用真实令牌（假服务令牌运行时随机生成），也不读写真实 `~/.dsh` profile。
 
 ## 关于 `.tmp/` 与少量空目录
 

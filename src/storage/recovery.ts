@@ -33,12 +33,12 @@ export function recoverInterruptedTasks(store: MomentsStore): number {
 }
 
 /** 只过期未执行的内容；绝不把 UNCERTAIN 当作可删除草稿。 */
-export function expirePendingTasks(store: MomentsStore, now = new Date(), draftTtlMs = 7 * 86400_000): number {
+export function expirePendingTasks(store: MomentsStore, now = new Date(), draftTtlMs = 7 * 86400_000, requireApproval = true): number {
   let expired = 0;
   for (const task of store.listOpenTasks(500)) {
     if (!canTransition(task.state, 'EXPIRED') || task.state === 'PREPARED') continue;
     const approvals = store.listApprovalsForTask(task.taskId);
-    const approvalExpired = approvals.some((item) =>
+    const approvalExpired = requireApproval && approvals.some((item) =>
       ['pending', 'approved'].includes(item.status) && new Date(item.expiresAt).getTime() <= now.getTime());
     const stale = new Date(task.updatedAt).getTime() + draftTtlMs <= now.getTime();
     if (!stale && !approvalExpired) continue;

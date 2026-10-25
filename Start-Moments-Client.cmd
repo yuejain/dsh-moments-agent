@@ -1,6 +1,6 @@
 @echo off
 rem DSH Moments Agent client launcher (modern web client, Windows).
-rem Starts the local client service and opens an Edge/Chrome app window.
+rem One elevated Python process hosts both client and desktop executor.
 rem Keep this file ASCII-only: cmd.exe misparses multi-byte characters after chcp.
 chcp 65001 >nul
 setlocal EnableExtensions
@@ -30,7 +30,7 @@ echo Python: %PYTHON_EXE%
 echo Local UI: http://127.0.0.1:18770/
 echo Close the app window to stop the local service automatically.
 echo.
-"%PYTHON_EXE%" "client\server.py" --port 18770 %*
+"%PYTHON_EXE%" -X utf8 "client\server.py" --port 18770 %*
 set "EXIT_CODE=%ERRORLEVEL%"
 if not "%EXIT_CODE%"=="0" (
   echo.

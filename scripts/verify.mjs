@@ -84,6 +84,9 @@ try {
     'moments_publish',
     'moments_verify',
     'moments_health',
+    'moments_sync_chat_memory',
+    'moments_get_chat_memory',
+    'moments_update_member_impression',
   ];
   for (const name of required) assert.equal(tools.has(name), true, `未注册工具 ${name}`);
   assert.equal(guards.length, 1, '应注册一个工具守卫');
@@ -98,6 +101,9 @@ try {
   assert.equal(health.database, 'ok');
   assert.equal(health.version, JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')).version, '运行时版本应与安装包一致');
   assert.equal(typeof health.counts, 'object');
+  assert.equal(health.chatMemory.status, 'not_configured', '社交记忆应默认关闭');
+  assert.equal(health.chatMemory.details.enabled, false, '社交记忆应默认关闭');
+  assert.equal(health.chatMemory.details.includePrivate, false, '私聊应默认不读取');
 
   const statusTool = tools.get('moments_get_status');
   const status = await statusTool.execute({}, execution);

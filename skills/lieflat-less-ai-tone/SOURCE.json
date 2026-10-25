@@ -1,0 +1,11 @@
+{
+  "repository": "https://github.com/larashero3-dotcom/lieflat-less-ai-tone",
+  "commit": "27d29232f10124db904ca9c0536d0b67cb3b2833",
+  "license": "MIT",
+  "copyright": "Copyright (c) 2026 shiujan",
+  "skillSha256": "c55dec1765c2d6ce31f9e03e62876b36a3a65af830350d4d0d5bab6df766b042",
+  "runtimeFiles": [
+    "SKILL.md"
+  ],
+  "scriptsExecuted": false
+}

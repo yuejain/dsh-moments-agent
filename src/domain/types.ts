@@ -15,6 +15,7 @@ export const MOMENT_STATES = [
   'IMAGE_READY',
   'REVIEWING',
   'READY_FOR_APPROVAL',
+  'READY_TO_PUBLISH',
   'APPROVED',
   'QUEUED',
   'PREPARING',
@@ -326,6 +327,154 @@ export interface UserPreferenceRecord {
   readonly updatedAt: string;
 }
 
+// ---------------------------------------------------------------------------
+// 社交记忆：群聊 / 私聊 → 人物印象
+// ---------------------------------------------------------------------------
+
+export type ChatConversationKind = 'group' | 'private';
+
+/** 人物印象状态：证据不足待观察 / 已观察 / 所有者手工修正。 */
+export type MemberImpressionStatus = 'new' | 'observed' | 'owner_edited';
+
+export type MemberImpressionSource = 'auto' | 'owner' | 'agent';
+
+export interface ChatConversationRecord {
+  readonly conversationKey: string;
+  readonly kind: ChatConversationKind;
+  /** 匿名标签：群聊A / 私聊B，只用于提示词。 */
+  readonly label: string;
+  /** 真实群名或昵称，只在本地管理页展示。 */
+  readonly displayName: string;
+  /** 原始会话 ID，仅同步时使用；不进入提示词与管理 API。 */
+  readonly talker: string;
+  readonly accountId: string;
+  readonly enabled: boolean;
+  readonly lastSyncedAt: string | null;
+  readonly lastMessageAt: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface ChatMessageRecord {
+  readonly messageId: string;
+  readonly conversationKey: string;
+  readonly memberRef: string;
+  readonly senderName: string;
+  /** 已脱敏文本；不保留图片、文件、语音。 */
+  readonly text: string;
+  readonly sentAt: string;
+  readonly isSelf: boolean;
+  readonly ingestedAt: string;
+  readonly expiresAt: string;
+}
+
+export interface MemberImpressionRecord {
+  readonly impressionId: string;
+  readonly conversationKey: string;
+  readonly memberRef: string;
+  /** 提示词里使用的稳定别名。 */
+  readonly alias: string;
+  readonly displayName: string;
+  readonly summary: string;
+  readonly traits: readonly string[];
+  readonly topics: readonly string[];
+  readonly style: string;
+  readonly confidence: number;
+  readonly evidenceCount: number;
+  readonly status: MemberImpressionStatus;
+  readonly source: MemberImpressionSource;
+  readonly firstSeenAt: string;
+  readonly lastSeenAt: string | null;
+  readonly updatedAt: string;
+  readonly expiresAt: string;
+}
+
+/** 社交记忆设置的可序列化视图（与 config.ChatMemoryConfig 结构一致，避免循环依赖）。 */
+export interface ChatMemorySettingsView {
+  readonly enabled: boolean;
+  readonly includePrivate: boolean;
+  readonly conversations: readonly string[];
+  readonly syncIntervalMinutes: number;
+  readonly maxMessagesPerConversation: number;
+  readonly retentionDays: number;
+  readonly impressionTtlDays: number;
+  readonly maxMembersPerConversation: number;
+  readonly anonymizeInPrompts: boolean;
+  readonly useLlmExtraction: boolean;
+}
+
+export interface ChatSyncSkip {
+  readonly label: string;
+  readonly reason: string;
+}
+
+export interface ChatSyncResult {
+  readonly conversations: number;
+  readonly newMessages: number;
+  readonly impressionsUpdated: number;
+  readonly skipped: readonly ChatSyncSkip[];
+  readonly errors: readonly string[];
+}
+
+export interface ChatMemoryStats {
+  readonly conversations: number;
+  readonly messages: number;
+  readonly members: number;
+  readonly lastSyncedAt: string | null;
+}
+
+export interface ChatMemoryConversationView {
+  readonly conversation: ChatConversationRecord;
+  readonly members: readonly MemberImpressionRecord[];
+}
+
+/** 所有者视图：含真实昵称，只用于本机管理页。 */
+export interface ChatMemoryView {
+  readonly enabled: boolean;
+  readonly settings: ChatMemorySettingsView;
+  readonly stats: ChatMemoryStats;
+  readonly conversations: readonly ChatMemoryConversationView[];
+}
+
+export interface ChatMemoryAgentMemberView {
+  readonly impressionId: string;
+  readonly alias: string;
+  readonly summary: string;
+  readonly traits: readonly string[];
+  readonly topics: readonly string[];
+  readonly style: string;
+  readonly confidence: number;
+  readonly evidenceCount: number;
+  readonly status: MemberImpressionStatus;
+}
+
+export interface ChatMemoryAgentConversationView {
+  readonly conversationKey: string;
+  readonly label: string;
+  readonly kind: ChatConversationKind;
+  readonly lastSyncedAt: string | null;
+  readonly members: readonly ChatMemoryAgentMemberView[];
+}
+
+/** Agent 视图：只有别名与摘要，不含真实昵称、wxid、聊天原文。 */
+export interface ChatMemoryAgentView {
+  readonly enabled: boolean;
+  readonly stats: ChatMemoryStats;
+  readonly conversations: readonly ChatMemoryAgentConversationView[];
+  readonly signals: readonly string[];
+}
+
+export interface MemberImpressionPatch {
+  readonly alias?: string;
+  readonly summary?: string;
+  readonly traits?: readonly string[];
+  readonly topics?: readonly string[];
+  readonly style?: string;
+  readonly status?: MemberImpressionStatus;
+  /** 证据条数（owner 手工修正时可传；Agent 不允许）。 */
+  readonly evidenceCount?: number;
+}
+
 export interface AuditEventRecord {
   readonly eventId: string;
   readonly at: string;
@@ -352,6 +501,8 @@ export interface HealthSnapshot {
   readonly desktopExecutor: AdapterHealth;
   readonly llm: AdapterHealth;
   readonly images: AdapterHealth;
+  /** 社交记忆状态（可选：旧快照没有该字段）。 */
+  readonly chatMemory?: AdapterHealth;
   readonly counts: Record<string, number>;
   readonly checkedAt: string;
 }

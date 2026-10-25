@@ -11,6 +11,9 @@ import type {
   ApprovalRecord,
   ApprovalStatus,
   AuditEventRecord,
+  ChatConversationKind,
+  ChatConversationRecord,
+  ChatMessageRecord,
   DraftRecord,
   DraftVersionRecord,
   IdeaRecord,
@@ -19,6 +22,9 @@ import type {
   ImageTaskRecord,
   ImageTaskStatus,
   MediaAssetRecord,
+  MemberImpressionRecord,
+  MemberImpressionSource,
+  MemberImpressionStatus,
   MomentState,
   PersonaMemoryRecord,
   PreviewPackage,
@@ -46,6 +52,7 @@ const TASK_STATES_OPEN = [
   'IMAGE_READY',
   'REVIEWING',
   'READY_FOR_APPROVAL',
+  'READY_TO_PUBLISH',
   'APPROVED',
   'QUEUED',
   'PREPARING',
@@ -306,6 +313,100 @@ function mapAudit(row: Record<string, unknown>): AuditEventRecord {
     reason: str(row, 'reason'),
     metadata: json<Record<string, unknown>>(row.metadata, {}),
   };
+}
+
+function mapChatConversation(row: Record<string, unknown>): ChatConversationRecord {
+  return {
+    conversationKey: str(row, 'conversation_key'),
+    kind: str(row, 'kind') as ChatConversationKind,
+    label: str(row, 'label'),
+    displayName: str(row, 'display_name'),
+    talker: str(row, 'talker'),
+    accountId: str(row, 'account_id'),
+    enabled: bool(row, 'enabled'),
+    lastSyncedAt: nstr(row, 'last_synced_at'),
+    lastMessageAt: nstr(row, 'last_message_at'),
+    createdAt: str(row, 'created_at'),
+    updatedAt: str(row, 'updated_at'),
+  };
+}
+
+function mapChatMessage(row: Record<string, unknown>): ChatMessageRecord {
+  return {
+    messageId: str(row, 'message_id'),
+    conversationKey: str(row, 'conversation_key'),
+    memberRef: str(row, 'member_ref'),
+    senderName: str(row, 'sender_name'),
+    text: str(row, 'text'),
+    sentAt: str(row, 'sent_at'),
+    isSelf: bool(row, 'is_self'),
+    ingestedAt: str(row, 'ingested_at'),
+    expiresAt: str(row, 'expires_at'),
+  };
+}
+
+function mapMemberImpression(row: Record<string, unknown>): MemberImpressionRecord {
+  return {
+    impressionId: str(row, 'impression_id'),
+    conversationKey: str(row, 'conversation_key'),
+    memberRef: str(row, 'member_ref'),
+    alias: str(row, 'alias'),
+    displayName: str(row, 'display_name'),
+    summary: str(row, 'summary'),
+    traits: json<string[]>(row.traits, []),
+    topics: json<string[]>(row.topics, []),
+    style: str(row, 'style'),
+    confidence: num(row, 'confidence'),
+    evidenceCount: num(row, 'evidence_count'),
+    status: str(row, 'status') as MemberImpressionStatus,
+    source: str(row, 'source') as MemberImpressionSource,
+    firstSeenAt: str(row, 'first_seen_at'),
+    lastSeenAt: nstr(row, 'last_seen_at'),
+    updatedAt: str(row, 'updated_at'),
+    expiresAt: str(row, 'expires_at'),
+  };
+}
+
+export interface ChatConversationInput {
+  readonly conversationKey: string;
+  readonly kind: ChatConversationKind;
+  readonly label: string;
+  readonly displayName: string;
+  readonly talker: string;
+  readonly accountId: string;
+  readonly enabled?: boolean;
+}
+
+export interface ChatMessageInput {
+  readonly messageId: string;
+  readonly conversationKey: string;
+  readonly memberRef: string;
+  readonly senderName: string;
+  readonly text: string;
+  readonly sentAt: string;
+  readonly isSelf: boolean;
+  readonly ingestedAt: string;
+  readonly expiresAt: string;
+}
+
+export interface MemberImpressionInput {
+  readonly impressionId: string;
+  readonly conversationKey: string;
+  readonly memberRef: string;
+  readonly alias: string;
+  readonly displayName: string;
+  readonly summary: string;
+  readonly traits: readonly string[];
+  readonly topics: readonly string[];
+  readonly style: string;
+  readonly confidence: number;
+  readonly evidenceCount: number;
+  readonly status: MemberImpressionStatus;
+  readonly source: MemberImpressionSource;
+  readonly firstSeenAt: string;
+  readonly lastSeenAt: string | null;
+  readonly updatedAt: string;
+  readonly expiresAt: string;
 }
 
 const TASK_PATCH_FIELDS: Record<keyof TaskPatch, string> = {
@@ -1072,6 +1173,242 @@ export class MomentsStore {
       createdAt: str(row, 'created_at'),
       updatedAt: str(row, 'updated_at'),
     }));
+  }
+
+  // ---------------------------------------------------------------------------
+  // 社交记忆：会话 / 消息 / 人物印象
+  // ---------------------------------------------------------------------------
+
+  upsertChatConversation(input: ChatConversationInput): ChatConversationRecord {
+    const at = this.at();
+    this.driver
+      .prepare(
+        `INSERT INTO chat_conversations (conversation_key, kind, label, display_name, talker, account_id, enabled,
+          last_synced_at, last_message_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+         ON CONFLICT(conversation_key) DO UPDATE SET kind = excluded.kind, label = excluded.label,
+           display_name = excluded.display_name, talker = excluded.talker, account_id = excluded.account_id,
+           enabled = excluded.enabled, updated_at = excluded.updated_at`,
+      )
+      .run(
+        input.conversationKey,
+        input.kind,
+        input.label,
+        input.displayName,
+        input.talker,
+        input.accountId,
+        input.enabled === false ? 0 : 1,
+        at,
+        at,
+      );
+    return this.requireChatConversation(input.conversationKey);
+  }
+
+  listChatConversations(options: { enabledOnly?: boolean } = {}): ChatConversationRecord[] {
+    const sql = options.enabledOnly === true
+      ? 'SELECT * FROM chat_conversations WHERE enabled = 1 ORDER BY updated_at DESC'
+      : 'SELECT * FROM chat_conversations ORDER BY updated_at DESC';
+    return this.driver.prepare(sql).all().map((row) => mapChatConversation(row));
+  }
+
+  getChatConversation(conversationKey: string): ChatConversationRecord | undefined {
+    const row = this.driver.prepare('SELECT * FROM chat_conversations WHERE conversation_key = ?').get(conversationKey);
+    return row === undefined ? undefined : mapChatConversation(row);
+  }
+
+  requireChatConversation(conversationKey: string): ChatConversationRecord {
+    const conversation = this.getChatConversation(conversationKey);
+    if (conversation === undefined) throw new MomentsError('NOT_FOUND', '会话不存在');
+    return conversation;
+  }
+
+  markChatConversationSynced(conversationKey: string, lastSyncedAt: string, lastMessageAt: string | null): void {
+    this.driver
+      .prepare(
+        `UPDATE chat_conversations SET last_synced_at = ?, last_message_at = COALESCE(?, last_message_at),
+           updated_at = ? WHERE conversation_key = ?`,
+      )
+      .run(lastSyncedAt, lastMessageAt, this.at(), conversationKey);
+  }
+
+  deleteChatConversation(conversationKey: string): void {
+    this.tx.run(() => {
+      this.driver.prepare('DELETE FROM chat_messages WHERE conversation_key = ?').run(conversationKey);
+      this.driver.prepare('DELETE FROM member_impressions WHERE conversation_key = ?').run(conversationKey);
+      this.driver.prepare('DELETE FROM chat_conversations WHERE conversation_key = ?').run(conversationKey);
+    });
+  }
+
+  /** 幂等入库；返回新增条数（重复 message_id 被忽略）。 */
+  insertChatMessages(messages: readonly ChatMessageInput[]): number {
+    if (messages.length === 0) return 0;
+    return this.tx.run(() => {
+      const statement = this.driver.prepare(
+        `INSERT OR IGNORE INTO chat_messages (message_id, conversation_key, member_ref, sender_name, text,
+          sent_at, is_self, ingested_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      let inserted = 0;
+      for (const message of messages) {
+        inserted += statement.run(
+          message.messageId,
+          message.conversationKey,
+          message.memberRef,
+          message.senderName,
+          message.text,
+          message.sentAt,
+          message.isSelf ? 1 : 0,
+          message.ingestedAt,
+          message.expiresAt,
+        ).changes;
+      }
+      return inserted;
+    });
+  }
+
+  /** 最近消息在前；提炼时由调用方按时间升序重排。 */
+  listChatMessages(conversationKey: string, limit = 500): ChatMessageRecord[] {
+    return this.driver
+      .prepare('SELECT * FROM chat_messages WHERE conversation_key = ? ORDER BY sent_at DESC, message_id DESC LIMIT ?')
+      .all(conversationKey, Math.min(Math.max(limit, 1), 1000))
+      .map((row) => mapChatMessage(row));
+  }
+
+  /** 最近入库消息（跨会话，最多 2000 条），供泄漏门禁的统一上下文使用。 */
+  listRecentChatMessages(limit = 1000): ChatMessageRecord[] {
+    return this.driver
+      .prepare('SELECT * FROM chat_messages ORDER BY ingested_at DESC, message_id DESC LIMIT ?')
+      .all(Math.min(Math.max(limit, 1), 2000))
+      .map((row) => mapChatMessage(row));
+  }
+
+  countChatMessages(conversationKey?: string): number {
+    const row = conversationKey === undefined
+      ? this.driver.prepare('SELECT COUNT(*) AS n FROM chat_messages').get()
+      : this.driver.prepare('SELECT COUNT(*) AS n FROM chat_messages WHERE conversation_key = ?').get(conversationKey);
+    return row === undefined ? 0 : num(row, 'n');
+  }
+
+  pruneChatMessages(expiredBefore: string): number {
+    return this.driver.prepare('DELETE FROM chat_messages WHERE expires_at < ?').run(expiredBefore).changes;
+  }
+
+  deleteChatMessages(conversationKey: string): number {
+    return this.driver.prepare('DELETE FROM chat_messages WHERE conversation_key = ?').run(conversationKey).changes;
+  }
+
+  upsertMemberImpression(input: MemberImpressionInput): MemberImpressionRecord {
+    this.driver
+      .prepare(
+        `INSERT INTO member_impressions (impression_id, conversation_key, member_ref, alias, display_name, summary,
+          traits, topics, style, confidence, evidence_count, status, source, first_seen_at, last_seen_at,
+          updated_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(conversation_key, member_ref) DO UPDATE SET alias = excluded.alias,
+           display_name = excluded.display_name, summary = excluded.summary, traits = excluded.traits,
+           topics = excluded.topics, style = excluded.style, confidence = excluded.confidence,
+           evidence_count = excluded.evidence_count, status = excluded.status, source = excluded.source,
+           last_seen_at = excluded.last_seen_at, updated_at = excluded.updated_at, expires_at = excluded.expires_at`,
+      )
+      .run(
+        input.impressionId,
+        input.conversationKey,
+        input.memberRef,
+        input.alias,
+        input.displayName,
+        input.summary,
+        JSON.stringify(input.traits),
+        JSON.stringify(input.topics),
+        input.style,
+        input.confidence,
+        input.evidenceCount,
+        input.status,
+        input.source,
+        input.firstSeenAt,
+        input.lastSeenAt,
+        input.updatedAt,
+        input.expiresAt,
+      );
+    const row = this.driver
+      .prepare('SELECT * FROM member_impressions WHERE conversation_key = ? AND member_ref = ?')
+      .get(input.conversationKey, input.memberRef);
+    if (row === undefined) throw new MomentsError('INTERNAL_ERROR', '人物印象写入失败');
+    return mapMemberImpression(row);
+  }
+
+  getMemberImpression(impressionId: string): MemberImpressionRecord | undefined {
+    const row = this.driver.prepare('SELECT * FROM member_impressions WHERE impression_id = ?').get(impressionId);
+    return row === undefined ? undefined : mapMemberImpression(row);
+  }
+
+  listMemberImpressions(
+    conversationKey?: string,
+    limit = 200,
+    options: { includeExpired?: boolean; nowIso?: string } = {},
+  ): MemberImpressionRecord[] {
+    const nowIso = options.nowIso ?? this.at();
+    const capped = Math.min(Math.max(limit, 1), 500);
+    const clauses: string[] = [];
+    const params: unknown[] = [];
+    if (conversationKey !== undefined) {
+      clauses.push('conversation_key = ?');
+      params.push(conversationKey);
+    }
+    if (options.includeExpired !== true) {
+      clauses.push('expires_at >= ?');
+      params.push(nowIso);
+    }
+    const where = clauses.length === 0 ? '' : ` WHERE ${clauses.join(' AND ')}`;
+    return this.driver
+      .prepare(`SELECT * FROM member_impressions${where} ORDER BY updated_at DESC LIMIT ?`)
+      .all(...params, capped)
+      .map((row) => mapMemberImpression(row));
+  }
+
+  /** 按证据条数取头部成员，用于匿名提示词摘要。 */
+  listTopMemberImpressions(nowIso: string, limit = 8): MemberImpressionRecord[] {
+    return this.driver
+      .prepare(
+        `SELECT * FROM member_impressions WHERE expires_at >= ?
+         ORDER BY evidence_count DESC, confidence DESC LIMIT ?`,
+      )
+      .all(nowIso, Math.min(Math.max(limit, 1), 50))
+      .map((row) => mapMemberImpression(row));
+  }
+
+  deleteMemberImpression(impressionId: string): void {
+    this.driver.prepare('DELETE FROM member_impressions WHERE impression_id = ?').run(impressionId);
+  }
+
+  deleteMemberImpressions(conversationKey: string): number {
+    return this.driver.prepare('DELETE FROM member_impressions WHERE conversation_key = ?').run(conversationKey).changes;
+  }
+
+  countMemberImpressions(conversationKey?: string): number {
+    const row = conversationKey === undefined
+      ? this.driver.prepare('SELECT COUNT(*) AS n FROM member_impressions').get()
+      : this.driver
+          .prepare('SELECT COUNT(*) AS n FROM member_impressions WHERE conversation_key = ?')
+          .get(conversationKey);
+    return row === undefined ? 0 : num(row, 'n');
+  }
+
+  chatMemoryCounts(): { conversations: number; messages: number; members: number } {
+    const row = this.driver
+      .prepare(
+        `SELECT (SELECT COUNT(*) FROM chat_conversations) AS conversations,
+                (SELECT COUNT(*) FROM chat_messages) AS messages,
+                (SELECT COUNT(*) FROM member_impressions) AS members`,
+      )
+      .get();
+    return { conversations: num(row ?? {}, 'conversations'), messages: num(row ?? {}, 'messages'), members: num(row ?? {}, 'members') };
+  }
+
+  purgeChatMemory(): void {
+    this.tx.run(() => {
+      this.driver.prepare('DELETE FROM chat_messages').run();
+      this.driver.prepare('DELETE FROM member_impressions').run();
+      this.driver.prepare('DELETE FROM chat_conversations').run();
+    });
   }
 
   appendAudit(event: Omit<AuditEventRecord, 'eventId'>): AuditEventRecord {

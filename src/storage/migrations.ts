@@ -234,4 +234,59 @@ CREATE TABLE owner_command_receipts (
 );
 CREATE INDEX idx_command_receipts_at ON owner_command_receipts(claimed_at);
 ` },
+  // 版本 3：社交记忆（群聊/私聊 → 人物印象）。
+  // talker / sender_name 是本地敏感数据，不进入提示词与管理 API 的匿名视图。
+  { version: 3, sql: `
+CREATE TABLE chat_conversations (
+  conversation_key TEXT PRIMARY KEY,
+  kind TEXT NOT NULL CHECK (kind IN ('group','private')),
+  label TEXT NOT NULL,
+  display_name TEXT NOT NULL,
+  talker TEXT NOT NULL,
+  account_id TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  last_synced_at TEXT,
+  last_message_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX idx_chat_conversations_updated ON chat_conversations(updated_at);
+
+CREATE TABLE chat_messages (
+  message_id TEXT PRIMARY KEY,
+  conversation_key TEXT NOT NULL,
+  member_ref TEXT NOT NULL,
+  sender_name TEXT NOT NULL DEFAULT '',
+  text TEXT NOT NULL,
+  sent_at TEXT NOT NULL,
+  is_self INTEGER NOT NULL DEFAULT 0,
+  ingested_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+CREATE INDEX idx_chat_messages_conv ON chat_messages(conversation_key, sent_at);
+CREATE INDEX idx_chat_messages_expires ON chat_messages(expires_at);
+
+CREATE TABLE member_impressions (
+  impression_id TEXT PRIMARY KEY,
+  conversation_key TEXT NOT NULL,
+  member_ref TEXT NOT NULL,
+  alias TEXT NOT NULL,
+  display_name TEXT NOT NULL DEFAULT '',
+  summary TEXT NOT NULL DEFAULT '',
+  traits TEXT NOT NULL DEFAULT '[]',
+  topics TEXT NOT NULL DEFAULT '[]',
+  style TEXT NOT NULL DEFAULT '',
+  confidence REAL NOT NULL DEFAULT 0,
+  evidence_count INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'new' CHECK (status IN ('new','observed','owner_edited')),
+  source TEXT NOT NULL DEFAULT 'auto' CHECK (source IN ('auto','owner','agent')),
+  first_seen_at TEXT NOT NULL,
+  last_seen_at TEXT,
+  updated_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  UNIQUE (conversation_key, member_ref)
+);
+CREATE INDEX idx_impressions_conv ON member_impressions(conversation_key, updated_at);
+CREATE INDEX idx_impressions_expires ON member_impressions(expires_at);
+` },
 ];

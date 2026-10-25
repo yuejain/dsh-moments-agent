@@ -202,8 +202,29 @@ export class AdminServer {
       runtime.updatePersona({ soul: body.soul, visualStyle: body.visualStyle });
       this.send(response, 200, { ok: true, data: runtime.personaView() }); return;
     }
+    if (method === 'GET' && pathname === '/api/publish-mode') {
+      this.send(response, 200, { ok: true, data: runtime.publishModeView() }); return;
+    }
+    if (method === 'GET' && pathname === '/api/writing-skills') {
+      this.send(response, 200, { ok:true, data:runtime.writingSkillsView() }); return;
+    }
+    if (method === 'GET' && pathname === '/api/environment') {
+      this.send(response, 200, {ok:true,data:runtime.environmentView()}); return;
+    }
+    if (method === 'POST' && pathname === '/api/writing-skills') {
+      this.send(response, 200, { ok:true, data:runtime.updateWritingSkills(await this.readBody(request)) }); return;
+    }
+    if (method === 'POST' && pathname === '/api/publish-mode') {
+      this.send(response, 200, { ok: true, data: runtime.updatePublishMode(await this.readBody(request)) }); return;
+    }
     if (method === 'GET' && pathname === '/api/schedule') {
       this.send(response, 200, { ok: true, data: runtime.scheduleView() }); return;
+    }
+    if (method === 'GET' && pathname === '/api/automation') {
+      this.send(response, 200, { ok: true, data: runtime.automationView() }); return;
+    }
+    if (method === 'POST' && pathname === '/api/automation') {
+      this.send(response, 200, { ok: true, data: runtime.updateAutomation(await this.readBody(request)) }); return;
     }
     if (method === 'POST' && pathname === '/api/schedule') {
       this.send(response, 200, { ok: true, data: runtime.updateSchedule(await this.readBody(request)) }); return;
@@ -224,6 +245,41 @@ export class AdminServer {
       runtime.deleteMemory(decodeURIComponent(pathname.split('/')[3] as string));
       this.send(response, 200, { ok: true }); return;
     }
+    // 社交记忆：所有者本机查看与手工修正。返回含真实昵称，只允许 127.0.0.1 + 管理令牌，
+    // 不提供原始聊天正文读取、批量导出或关闭审计。
+    if (method === 'GET' && pathname === '/api/chat-memory') {
+      this.send(response, 200, { ok: true, data: this.ownerChatMemoryView(runtime) });
+      return;
+    }
+    if (method === 'POST' && pathname === '/api/chat-memory/settings') {
+      this.send(response, 200, { ok: true, data: runtime.updateChatMemorySettings(await this.readBody(request)) });
+      return;
+    }
+    if (method === 'POST' && pathname === '/api/chat-memory/sync') {
+      // body 当前只接受 {}（同步总是立即执行）；读取后忽略，保持请求流可复用连接。
+      await this.readBody(request);
+      this.send(response, 200, { ok: true, data: await runtime.syncChatMemory() });
+      return;
+    }
+    if (method === 'PATCH' && /^\/api\/chat-memory\/members\/[^/]+$/.test(pathname)) {
+      const impressionId = decodeURIComponent(pathname.slice('/api/chat-memory/members/'.length));
+      this.send(response, 200, {
+        ok: true,
+        data: runtime.updateChatMemberImpression(impressionId, await this.readBody(request), 'owner'),
+      });
+      return;
+    }
+    if (method === 'DELETE' && /^\/api\/chat-memory\/members\/[^/]+$/.test(pathname)) {
+      const impressionId = decodeURIComponent(pathname.slice('/api/chat-memory/members/'.length));
+      runtime.deleteChatMemberImpression(impressionId);
+      this.send(response, 200, { ok: true });
+      return;
+    }
+    if (method === 'DELETE' && /^\/api\/chat-memory\/conversations\/[^/]+$/.test(pathname)) {
+      const conversationKey = decodeURIComponent(pathname.slice('/api/chat-memory/conversations/'.length));
+      this.send(response, 200, { ok: true, data: runtime.purgeChatConversation(conversationKey) });
+      return;
+    }
     if (method === 'GET' && pathname === '/api/health') {
       this.send(response, 200, { ok: true, data: await runtime.health() });
       return;
@@ -231,6 +287,12 @@ export class AdminServer {
     if (method === 'GET' && pathname === '/api/status') {
       const taskId = url.searchParams.get('taskId') ?? undefined;
       this.send(response, 200, { ok: true, data: await runtime.status(taskId) });
+      return;
+    }
+    // 只读：拟人化自动发送的状态（配置、下次可发时间、今日计数、队列、最后错误）。
+    // 管理面不提供任何“立即发送/跳过审批”的写接口。
+    if (method === 'GET' && pathname === '/api/humanize') {
+      this.send(response, 200, { ok: true, data: runtime.humanizeStatus() });
       return;
     }
     if (method === 'GET' && pathname === '/api/tasks') {
@@ -398,6 +460,51 @@ export class AdminServer {
     }
     this.send(response, 404, { ok: false, message: '未知端点或方法' });
   }
+
+  /**
+   * 所有者视图脱敏：服务层记录含原始 talker / accountId，管理 API 只回传页面需要的字段。
+   * 真实昵称（displayName）仍返回，因为管理页需要让所有者辨认会话；但它只在本机回环 + 令牌下可见。
+   */
+  private ownerChatMemoryView(runtime: MomentsRuntime): {
+    enabled: boolean;
+    settings: ReturnType<MomentsRuntime['chatMemoryView']>['settings'];
+    stats: ReturnType<MomentsRuntime['chatMemoryView']>['stats'];
+    conversations: {
+      conversation: {
+        conversationKey: string;
+        kind: 'group' | 'private';
+        label: string;
+        displayName: string;
+        enabled: boolean;
+        lastSyncedAt: string | null;
+        lastMessageAt: string | null;
+        createdAt: string;
+        updatedAt: string;
+      };
+      members: ReturnType<MomentsRuntime['chatMemoryView']>['conversations'][number]['members'];
+    }[];
+  } {
+    const view = runtime.chatMemoryView();
+    return {
+      enabled: view.enabled,
+      settings: view.settings,
+      stats: view.stats,
+      conversations: view.conversations.map(({ conversation, members }) => ({
+        conversation: {
+          conversationKey: conversation.conversationKey,
+          kind: conversation.kind,
+          label: conversation.label,
+          displayName: conversation.displayName,
+          enabled: conversation.enabled,
+          lastSyncedAt: conversation.lastSyncedAt,
+          lastMessageAt: conversation.lastMessageAt,
+          createdAt: conversation.createdAt,
+          updatedAt: conversation.updatedAt,
+        },
+        members,
+      })),
+    };
+  }
 }
 
 function escapeHtml(value: string): string {
@@ -510,6 +617,20 @@ function renderPage(): string {
     <pre id="publishResult">尚未操作</pre>
   </section>
   <section>
+    <h2>社交记忆</h2>
+    <div class="row">
+      <label class="muted"><input id="chatMemoryEnabled" type="checkbox"> 启用社交记忆</label>
+      <label class="muted"><input id="chatMemoryIncludePrivate" type="checkbox"> 包含私聊</label>
+      <button onclick="saveChatMemorySettings()">保存设置</button>
+      <button class="primary" onclick="syncChatMemory()">立即同步</button>
+      <button onclick="loadChatMemory()">刷新</button>
+    </div>
+    <div class="muted" id="chatMemoryStats">尚未加载</div>
+    <pre id="chatMemoryResult">尚未操作</pre>
+    <div id="chatMemoryConversations" class="muted">尚未加载</div>
+    <div class="muted">只读 WeChatAgent 白名单内的群聊/私聊；人物印象可在此手工修正，聊天原文不会进入提示词或朋友圈。</div>
+  </section>
+  <section>
     <h2>历史</h2>
     <div class="row"><button onclick="history()">刷新历史</button></div>
     <pre id="history">尚未加载</pre>
@@ -525,6 +646,11 @@ async function api(path, method='GET', body){
   const res = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
   const text = await res.text();
   try { return { status: res.status, data: JSON.parse(text) }; } catch { return { status: res.status, data: text }; }
+}
+async function post(path, body){
+  const r = await api(path, 'POST', body === undefined ? {} : body);
+  alert(JSON.stringify(r.data, null, 2));
+  load();
 }
 async function load(which){
   const r = await api('/api/status');
@@ -590,8 +716,178 @@ async function history(){
   const r = await api('/api/history');
   $('history').textContent = JSON.stringify(r.data, null, 2);
 }
+// ---------------------------------------------------------------------------
+// 社交记忆：只做展示与手工修正，不提供批量导出。
+// ---------------------------------------------------------------------------
+let chatMemoryCache = null;
+function esc(value){
+  return String(value === undefined || value === null ? '' : value).replace(/[&<>"']/g, function(char){
+    if (char === '&') return '&amp;';
+    if (char === '<') return '&lt;';
+    if (char === '>') return '&gt;';
+    if (char === '"') return '&quot;';
+    return '&#39;';
+  });
+}
+function chatStatusLabel(status){
+  if (status === 'owner_edited') return '已人工修正';
+  if (status === 'observed') return '已观察';
+  return '待观察';
+}
+async function loadChatMemory(){
+  const r = await api('/api/chat-memory');
+  if (!r.data || r.data.ok !== true) {
+    $('chatMemoryStats').textContent = '';
+    $('chatMemoryConversations').textContent = '加载失败：' + JSON.stringify(r.data);
+    return;
+  }
+  chatMemoryCache = r.data.data;
+  renderChatMemory();
+}
+function findChatMember(impressionId){
+  if (!chatMemoryCache) return null;
+  const conversations = chatMemoryCache.conversations || [];
+  for (let i = 0; i < conversations.length; i += 1) {
+    const members = conversations[i].members || [];
+    for (let j = 0; j < members.length; j += 1) {
+      if (members[j].impressionId === impressionId) return members[j];
+    }
+  }
+  return null;
+}
+function renderChatMemory(){
+  const view = chatMemoryCache;
+  if (!view) return;
+  $('chatMemoryEnabled').checked = view.settings.enabled === true;
+  $('chatMemoryIncludePrivate').checked = view.settings.includePrivate === true;
+  const stats = view.stats || {};
+  $('chatMemoryStats').textContent = '会话 ' + String(stats.conversations || 0)
+    + ' 个 · 消息 ' + String(stats.messages || 0)
+    + ' 条 · 人物印象 ' + String(stats.members || 0)
+    + ' 条 · 最近同步：' + String(stats.lastSyncedAt || '从未同步');
+  const container = $('chatMemoryConversations');
+  const conversations = view.conversations || [];
+  if (conversations.length === 0) {
+    container.innerHTML = '<span class="muted">暂无会话数据：开启开关并点击「立即同步」。</span>';
+    return;
+  }
+  const html = [];
+  for (let i = 0; i < conversations.length; i += 1) {
+    const item = conversations[i] || {};
+    const conv = item.conversation || {};
+    html.push('<div style="border:1px solid #262a33;border-radius:8px;padding:10px;margin:10px 0;">');
+    html.push('<div class="row"><strong>' + esc(conv.displayName || '（无名称）') + '</strong>'
+      + '<span class="muted">' + esc(conv.label || '') + ' · '
+      + esc(conv.kind === 'group' ? '群聊' : '私聊') + ' · 最近消息：'
+      + esc(conv.lastMessageAt || '无')
+      + (conv.enabled === false ? ' · 未参与同步（私聊未开启或已停用）' : '')
+      + '</span>'
+      + '<button class="danger" data-chat-action="purge" data-chat-id="' + esc(conv.conversationKey) + '">清除会话</button>'
+      + '</div>');
+    const members = item.members || [];
+    if (members.length === 0) {
+      html.push('<div class="muted">该会话暂无人物印象（证据不足或尚未提炼）。</div>');
+    }
+    for (let j = 0; j < members.length; j += 1) {
+      const member = members[j] || {};
+      html.push('<div style="border-top:1px solid #262a33;padding:8px 0;">');
+      html.push('<div class="row"><strong>' + esc(member.alias || '（未命名）') + '</strong>'
+        + '<span class="muted">本机昵称：' + esc(member.displayName || '未知')
+        + ' · 证据 ' + String(member.evidenceCount || 0) + ' 条 · '
+        + esc(chatStatusLabel(member.status)) + '</span></div>');
+      html.push('<div class="muted">摘要：' + esc(member.summary || '（暂无摘要）') + '</div>');
+      html.push('<div class="muted">标签：' + esc((member.traits || []).join('、') || '无')
+        + ' · 话题：' + esc((member.topics || []).join('、') || '无')
+        + ' · 风格：' + esc(member.style || '无') + '</div>');
+      html.push('<div class="row">');
+      html.push('<button data-chat-action="edit" data-chat-id="' + esc(member.impressionId)
+        + '" data-chat-field="summary">改摘要</button>');
+      html.push('<button data-chat-action="edit" data-chat-id="' + esc(member.impressionId)
+        + '" data-chat-field="alias">改别名</button>');
+      html.push('<button data-chat-action="edit" data-chat-id="' + esc(member.impressionId)
+        + '" data-chat-field="traits">改标签</button>');
+      html.push('<button data-chat-action="edit" data-chat-id="' + esc(member.impressionId)
+        + '" data-chat-field="status">改状态</button>');
+      html.push('<button class="danger" data-chat-action="delete" data-chat-id="' + esc(member.impressionId) + '">删除</button>');
+      html.push('</div></div>');
+    }
+    html.push('</div>');
+  }
+  container.innerHTML = html.join('');
+  const actionButtons = container.querySelectorAll('button[data-chat-action]');
+  for (let k = 0; k < actionButtons.length; k += 1) {
+    const button = actionButtons[k];
+    const action = button.getAttribute('data-chat-action');
+    const id = button.getAttribute('data-chat-id') || '';
+    const field = button.getAttribute('data-chat-field');
+    if (action === 'purge') {
+      button.addEventListener('click', function(){ purgeChatConversation(id); });
+    } else if (action === 'delete') {
+      button.addEventListener('click', function(){ deleteChatMember(id); });
+    } else if (action === 'edit' && field !== null) {
+      button.addEventListener('click', function(){ editChatMember(id, field); });
+    }
+  }
+}
+async function saveChatMemorySettings(){
+  const body = {
+    enabled: $('chatMemoryEnabled').checked,
+    includePrivate: $('chatMemoryIncludePrivate').checked,
+  };
+  const r = await api('/api/chat-memory/settings', 'POST', body);
+  $('chatMemoryResult').textContent = JSON.stringify(r.data, null, 2);
+  await loadChatMemory();
+}
+async function syncChatMemory(){
+  if (!confirm('立即同步社交记忆？只读取 WeChatAgent 白名单内的会话，不会发送任何微信消息。')) return;
+  const r = await api('/api/chat-memory/sync', 'POST', {});
+  $('chatMemoryResult').textContent = JSON.stringify(r.data, null, 2);
+  await loadChatMemory();
+}
+async function editChatMember(impressionId, field){
+  const member = findChatMember(impressionId);
+  const body = {};
+  if (field === 'summary') {
+    const value = prompt('新的印象摘要（最多 300 字）', member ? member.summary || '' : '');
+    if (value === null) return;
+    body.summary = value;
+  } else if (field === 'alias') {
+    const value = prompt('新的匿名别名（1~8 个中文/字母/数字/下划线）', member ? member.alias || '' : '');
+    if (value === null) return;
+    body.alias = value;
+  } else if (field === 'traits') {
+    const value = prompt('受控标签，用逗号或顿号分隔（最多 6 个）',
+      member ? (member.traits || []).join('、') : '');
+    if (value === null) return;
+    body.traits = value.split(/[,，、]/).map(function(part){ return part.trim(); })
+      .filter(function(part){ return part !== ''; });
+  } else if (field === 'status') {
+    const value = prompt('状态：new（待观察）/ observed（已观察）/ owner_edited（人工修正）',
+      member ? member.status || 'owner_edited' : 'owner_edited');
+    if (value === null) return;
+    body.status = value.trim();
+  } else {
+    return;
+  }
+  const r = await api('/api/chat-memory/members/' + encodeURIComponent(impressionId), 'PATCH', body);
+  $('chatMemoryResult').textContent = JSON.stringify(r.data, null, 2);
+  await loadChatMemory();
+}
+async function deleteChatMember(impressionId){
+  if (!confirm('确认删除该人物印象？此操作不可撤销。')) return;
+  const r = await api('/api/chat-memory/members/' + encodeURIComponent(impressionId), 'DELETE');
+  $('chatMemoryResult').textContent = JSON.stringify(r.data, null, 2);
+  await loadChatMemory();
+}
+async function purgeChatConversation(conversationKey){
+  if (!confirm('确认清除该会话的全部消息与人物印象？此操作不可撤销。')) return;
+  const r = await api('/api/chat-memory/conversations/' + encodeURIComponent(conversationKey), 'DELETE');
+  $('chatMemoryResult').textContent = JSON.stringify(r.data, null, 2);
+  await loadChatMemory();
+}
 $('token').value = localStorage.getItem('moments-admin-token') || '';
 load();
+loadChatMemory();
 </script>
 </body>
 </html>`;

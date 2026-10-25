@@ -5,7 +5,7 @@
 
 安全边界：
 - 默认 PREPARE_ONLY 且绝不点击发表；只有同时 ``--allow-publish`` 与
-  ``mode=APPROVAL_REQUIRED`` 时才允许；
+  ``mode 为 APPROVAL_REQUIRED 或 POLICY_AUTONOMOUS`` 时才允许；
 - 请求体上限 8 MiB；token 缺失/错误返回 401；未知端点 404；方法错误 405；
 - 所有资产路径与截图目录必须位于配置的根目录内，拒绝 ``..``、绝对路径逃逸、
   符号链接/重解析点；
@@ -48,10 +48,12 @@ if __package__ in (None, ""):  # 允许 ``python desktop/server.py`` 直接运�
         PathGuardError,
         Verification,
         describe_config,
+        ensure_directory_under,
         is_within,
         load_config_file,
         load_or_create_token,
         normalize_path,
+        normalize_text,
         read_token_file,
         require_content_hash,
         require_id_field,
@@ -65,7 +67,8 @@ if __package__ in (None, ""):  # 允许 ``python desktop/server.py`` 直接运�
     from desktop.moments_editor import MomentsEditor, PreparedSnapshot
     from desktop.moments_verifier import MomentsVerifier
     from desktop.wechat_driver import RealWechatDriver, WechatDriver
-    from desktop.window_locator import WindowLocator
+    from desktop.geometry_driver import GeometryWechatDriver
+    from desktop.window_locator import WindowLocator, dpi_awareness, ensure_dpi_aware
 else:
     from .account_guard import AccountGuard
     from .config import (
@@ -82,10 +85,12 @@ else:
         PathGuardError,
         Verification,
         describe_config,
+        ensure_directory_under,
         is_within,
         load_config_file,
         load_or_create_token,
         normalize_path,
+        normalize_text,
         read_token_file,
         require_content_hash,
         require_id_field,
@@ -99,7 +104,8 @@ else:
     from .moments_editor import MomentsEditor, PreparedSnapshot
     from .moments_verifier import MomentsVerifier
     from .wechat_driver import RealWechatDriver, WechatDriver
-    from .window_locator import WindowLocator
+    from .geometry_driver import GeometryWechatDriver
+    from .window_locator import WindowLocator, dpi_awareness, ensure_dpi_aware
 
 _LOGGER = logging.getLogger("dsh_moments.desktop.server")
 
@@ -145,6 +151,15 @@ def configure_logging(log_file: str | None, *, level: int = logging.INFO, logger
 # ---------------------------------------------------------------------------
 
 
+def build_driver(config: ExecutorConfig, logger: logging.Logger) -> WechatDriver:
+    """按配置选择驱动：默认 UIA；geometry 必须显式 opt-in。"""
+    locator = WindowLocator()
+    if getattr(config, "driver", "uia") == "geometry":
+        logger.info("启用 geometry 驱动（微信 4.x 几何/像素，opt-in）")
+        return GeometryWechatDriver(config, locator=locator, logger=logger)
+    return RealWechatDriver(config, locator=locator, logger=logger)
+
+
 class ExecutorApp:
     """桌面执行器应用状态与业务端点实现。"""
 
@@ -162,7 +177,7 @@ class ExecutorApp:
         self.logger = logger or _LOGGER
         self._screenshot_dir = normalize_path(config.screenshot_dir)
         self._asset_roots = tuple(normalize_path(root) for root in config.asset_roots)
-        self._driver = driver or RealWechatDriver(config, locator=WindowLocator(), logger=self.logger)
+        self._driver = driver or build_driver(config, self.logger)
         self._guard = AccountGuard(
             expected_account_id=config.expected_account_id,
             supported_versions=config.supported_versions,
@@ -181,6 +196,7 @@ class ExecutorApp:
         self._state_lock = threading.Lock()
         self._prepared: OrderedDict[str, PreparedSnapshot] = OrderedDict()
         self._verifications: dict[str, Verification] = {}
+        self._deletions: dict[str, dict[str, Any]] = {}
         self._submitted: set[str] = set()
         self._cancelled: set[str] = set()
         self._cancel_events: dict[str, threading.Event] = {}
@@ -233,9 +249,34 @@ class ExecutorApp:
     def health(self) -> dict[str, Any]:
         installation = self._driver.get_installation()
         uia_available = bool(self._driver.uia_available)
+        driver_kind = str(getattr(self._driver, "driver_kind", "uia"))
+        ocr_available = bool(getattr(self._driver, "ocr_available", False))
+        admin_privilege = bool(getattr(self._driver, "admin_privilege", False))
         effective_allow_publish = self.config.effective_allow_publish
         if not installation.installed:
             message = "微信客户端未安装或未找到；仅支持 Mock 与准备流程测试，禁止发表"
+        elif driver_kind == "geometry":
+            geometry_publish = bool(getattr(self.config, "effective_geometry_publish", False))
+            if not admin_privilege and bool(getattr(self.config, "geometry_require_admin", False)):
+                message = (
+                    f"微信客户端已安装（{installation.version or '版本未知'}）；"
+                    "geometry 驱动已启用，但配置要求管理员且当前非管理员权限，输入操作会返回 PRIVILEGE_REQUIRED"
+                )
+            elif not ocr_available:
+                message = (
+                    f"微信客户端已安装（{installation.version or '版本未知'}）；"
+                    "geometry 驱动已启用，但 OCR 不可用，无法核验，真实发布/删除未测试"
+                )
+            elif not geometry_publish:
+                message = (
+                    f"微信客户端已安装（{installation.version or '版本未知'}）；"
+                    "geometry 驱动已启用但未开启 geometry 发布权限，仅准备、禁止点击发表"
+                )
+            else:
+                message = (
+                    f"微信客户端已安装（{installation.version or '版本未知'}）；"
+                    "geometry 驱动（几何/像素/OCR）已授权，真实发布仍需一次性审批且未完成 NOT_TESTED 验收"
+                )
         elif not uia_available:
             message = (
                 f"微信客户端已安装（{installation.version or '版本未知'}），"
@@ -260,7 +301,25 @@ class ExecutorApp:
             "uiaAvailable": uia_available,
             "allowPublish": effective_allow_publish,
             "mode": self.config.mode,
+            "driver": driver_kind,
+            "ocrAvailable": ocr_available,
+            "adminPrivilege": admin_privilege,
+            "geometryRequireAdmin": bool(getattr(self.config, "geometry_require_admin", False)),
+            "processDpiAwareness": dpi_awareness(),
             "message": message,
+        }
+
+    def _driver_status_extras(self) -> dict[str, Any]:
+        """status 中暴露的驱动/OCR/重试/管理员信息（不包含任何敏感值）。"""
+        return {
+            "driver": str(getattr(self._driver, "driver_kind", "uia")),
+            "windowNormalization":{"enabled":self.config.geometry_normalize_window and self.config.driver=='geometry',
+                "mode":"physical-pixels","windowSize":[1200,900],"lastResult":getattr(self._driver,'_normalization',None)},
+            "processDpiAwareness": dpi_awareness(),
+            "geometryRequireAdmin": bool(getattr(self.config, "geometry_require_admin", False)),
+            "ocrAvailable": bool(getattr(self._driver, "ocr_available", False)),
+            "maxRetries": int(getattr(self.config, "max_publish_click_retries", 0)),
+            "adminPrivilege": bool(getattr(self._driver, "admin_privilege", False)),
         }
 
     def status(self) -> dict[str, Any]:
@@ -268,6 +327,7 @@ class ExecutorApp:
             client_status = self._driver.get_status(timeout=self.config.status_timeout)
             payload = {"ok": True}
             payload.update(client_status.to_dict())
+            payload.update(self._driver_status_extras())
             return payload
         except ExecutorError as exc:
             payload = {"ok": False, "errorCode": exc.code, "message": exc.message}
@@ -285,6 +345,7 @@ class ExecutorApp:
                     "notes": [exc.message],
                 }
             )
+            payload.update(self._driver_status_extras())
             return payload
         except Exception as exc:  # 保持响应结构稳定，避免插件解析崩溃
             self.logger.exception("读取微信状态未预期异常")
@@ -303,6 +364,7 @@ class ExecutorApp:
                 "dpiScale": None,
                 "notes": ["读取状态异常"],
             }
+            payload.update(self._driver_status_extras())
             return payload
 
     # -- prepare ----------------------------------------------------------
@@ -440,14 +502,25 @@ class ExecutorApp:
             self.logger.exception("publish 请求校验未预期异常")
             return self._publish_failure("INTERNAL_ERROR", f"请求校验失败（{type(exc).__name__}）")
 
+        if payload.get("publishMode") is not None and payload["publishMode"] != self.config.mode:
+            return self._publish_failure("PUBLISH_MODE_DISABLED", "插件与执行器发表模式不一致，未点击发表")
         # 1) 发布权限：默认 PREPARE_ONLY 或未显式 --allow-publish 时，这里是死路。
         if not self.config.effective_allow_publish:
             return self._publish_failure(
                 "PUBLISH_MODE_DISABLED",
-                "未开启发表权限（需要 --allow-publish 且 mode=APPROVAL_REQUIRED），未点击发表",
+                "未开启发表权限（需要 --allow-publish 且 mode 为 APPROVAL_REQUIRED 或 POLICY_AUTONOMOUS），未点击发表",
+            )
+        # 1b) 几何驱动额外要求 --geometry-allow-publish，绝不因驱动类型放大权限。
+        if (
+            getattr(self._driver, "driver_kind", "uia") == "geometry"
+            and not getattr(self.config, "effective_geometry_publish", False)
+        ):
+            return self._publish_failure(
+                "PUBLISH_MODE_DISABLED",
+                "几何驱动未开启发表权限（需要 --geometry-allow-publish + --allow-publish + 第二或第三档），未点击发表",
             )
         # 2) 审批 ID
-        if not request["approvalId"]:
+        if self.config.mode == "APPROVAL_REQUIRED" and not request["approvalId"]:
             return self._publish_failure("APPROVAL_REQUIRED", "缺少审批 ID，未点击发表")
         attempt_id = request["attemptId"]
         with self._state_lock:
@@ -545,6 +618,143 @@ class ExecutorApp:
             "message": message,
         }
 
+    @staticmethod
+    def _delete_failure(
+        code: str,
+        message: str,
+        *,
+        deleted: bool = False,
+        uncertain: bool = False,
+        screenshot_path: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "deleted": deleted,
+            "uncertain": uncertain,
+            "screenshotPath": screenshot_path,
+            "errorCode": code,
+            "message": message,
+        }
+
+    def _validate_delete_payload(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        if not isinstance(payload, Mapping):
+            raise ExecutorError("BAD_REQUEST", "请求体必须是 JSON 对象")
+        task_id = require_id_field(payload, "taskId")
+        attempt_id = require_id_field(payload, "attemptId")
+        content_hash = require_content_hash(payload)
+        account_id = require_id_field(payload, "accountId")
+        raw_expected = payload.get("expectedText")
+        if not isinstance(raw_expected, str) or not raw_expected.strip():
+            raise ExecutorError("BAD_REQUEST", "expectedText 必须是非空字符串")
+        max_text = min(int(self.config.max_text_length), MAX_TEXT_LENGTH)
+        if len(raw_expected) > max_text:
+            raise ExecutorError("BAD_REQUEST", f"expectedText 过长（最多 {max_text} 字符）")
+        return {
+            "taskId": task_id,
+            "attemptId": attempt_id,
+            "contentHash": content_hash,
+            "accountId": account_id,
+            "expectedText": raw_expected,
+        }
+
+    def delete(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """删除已发布朋友圈（仅 geometry 驱动；attempt 绑定 + 内容哈希校验）。"""
+        try:
+            request = self._validate_delete_payload(payload)
+        except ExecutorError as exc:
+            return self._delete_failure(exc.code, exc.message)
+        except Exception as exc:
+            self.logger.exception("delete 请求校验未预期异常")
+            return self._delete_failure("INTERNAL_ERROR", f"请求校验失败（{type(exc).__name__}）")
+
+        if not bool(getattr(self._driver, "supports_delete", False)):
+            return self._delete_failure(
+                "DESKTOP_UNSUPPORTED",
+                "当前驱动不支持删除已发布朋友圈（仅 geometry 驱动支持）",
+            )
+        if not getattr(self.config, "effective_geometry_publish", False):
+            return self._delete_failure(
+                "PUBLISH_MODE_DISABLED",
+                "几何驱动未开启删除权限（需要 --geometry-allow-publish + --allow-publish + 第二或第三档）",
+            )
+        attempt_id = request["attemptId"]
+        with self._state_lock:
+            snapshot = self._prepared.get(attempt_id)
+            submitted = attempt_id in self._submitted
+            cancelled = attempt_id in self._cancelled
+        if snapshot is None:
+            return self._delete_failure(
+                "BAD_REQUEST",
+                "没有该 attempt 的准备记录，无法绑定删除目标",
+            )
+        if not submitted:
+            return self._delete_failure(
+                "BAD_REQUEST",
+                "只能删除已经点击发表的 attempt（未点击发表的准备内容请取消而不是删除）",
+            )
+        if cancelled:
+            return self._delete_failure("CANCELLED", "该 attempt 已取消，未执行删除")
+        if request["contentHash"].lower() != snapshot.content_hash.lower():
+            return self._delete_failure(
+                "CONTENT_CHANGED",
+                "contentHash 与准备记录不一致，拒绝删除，需重新审批",
+            )
+        if request["accountId"] != snapshot.account_id:
+            return self._delete_failure(
+                "ACCOUNT_MISMATCH",
+                "accountId 与准备记录不一致，拒绝删除，需重新审批",
+            )
+        if request["taskId"] != snapshot.task_id:
+            return self._delete_failure("BAD_REQUEST", "taskId 与准备记录不一致，拒绝删除")
+        if normalize_text(request["expectedText"]) != normalize_text(snapshot.text):
+            return self._delete_failure(
+                "CONTENT_CHANGED",
+                "expectedText 与审批快照正文不一致，拒绝删除（避免误删其他动态）",
+            )
+
+        if not self._exec_lock.acquire(blocking=False):
+            return self._delete_failure("EXECUTOR_BUSY", "已有执行中的任务，请稍后重试")
+        cancel_event = threading.Event()
+        try:
+            with self._state_lock:
+                self._active_attempt = attempt_id
+                self._active_kind = "delete"
+                self._cancel_events[attempt_id] = cancel_event
+            evidence = self._artifact_path(attempt_id, "-deleted.png")
+            self.logger.info("收到 delete 请求 attemptId=%s", attempt_id)
+            outcome = self._driver.delete_published(
+                request["expectedText"],
+                evidence_path=evidence,
+                timeout=self.config.click_timeout,
+            )
+            payload = outcome.to_dict() if hasattr(outcome, "to_dict") else dict(outcome)
+            with self._state_lock:
+                self._deletions[attempt_id] = payload
+            return payload
+        except ExecutorError as exc:
+            self.logger.warning("删除失败 attemptId=%s code=%s", attempt_id, exc.code)
+            return self._delete_failure(exc.code, exc.message, uncertain=True)
+        except Exception as exc:
+            self.logger.exception("delete 未预期异常 attemptId=%s", attempt_id)
+            return self._delete_failure(
+                "UNCERTAIN",
+                f"删除流程发生未预期异常（{type(exc).__name__}），无法确认是否已删除，禁止自动重试",
+                uncertain=True,
+            )
+        finally:
+            with self._state_lock:
+                self._cancel_events.pop(attempt_id, None)
+                self._active_attempt = None
+                self._active_kind = None
+            self._exec_lock.release()
+
+    def _artifact_path(self, attempt_id: str, suffix: str) -> str:
+        """在配置的截图目录内生成安全产物路径。"""
+        safe_filename_component(attempt_id, name="attemptId")
+        ensure_directory_under((self._screenshot_dir,), self._screenshot_dir)
+        candidate = os.path.join(self._screenshot_dir, f"{attempt_id}{suffix}")
+        return resolve_under((self._screenshot_dir,), candidate)
+
     # -- verify / preview / cancel ---------------------------------------
 
     def verify(self, attempt_id: str) -> tuple[int, dict[str, Any]]:
@@ -625,6 +835,7 @@ class ExecutorApp:
                 "preparedAttempts": list(self._prepared.keys()),
                 "submittedAttempts": sorted(self._submitted),
                 "verificationAttempts": list(self._verifications.keys()),
+                "deletedAttempts": list(self._deletions.keys()),
                 "activeAttempt": self._active_attempt,
                 "activeKind": self._active_kind,
             }
@@ -656,6 +867,7 @@ _EXACT_ROUTES: dict[str, tuple[frozenset[str], str]] = {
     "/wechat/status": (frozenset({"GET"}), "status"),
     "/moments/prepare": (frozenset({"POST"}), "prepare"),
     "/moments/publish": (frozenset({"POST"}), "publish"),
+    "/moments/delete": (frozenset({"POST"}), "delete"),
     "/moments/cancel": (frozenset({"POST"}), "cancel"),
 }
 _PREFIX_ROUTES: tuple[tuple[str, frozenset[str], str], ...] = (
@@ -737,12 +949,14 @@ class ExecutorRequestHandler(BaseHTTPRequestHandler):
                 payload = app.health() if handler == "health" else app.status()
                 self._send_json(200, payload)
                 status = 200
-            elif handler in ("prepare", "publish", "cancel"):
+            elif handler in ("prepare", "publish", "delete", "cancel"):
                 body = self._read_json_body()
                 if handler == "prepare":
                     payload = app.prepare(body)
                 elif handler == "publish":
                     payload = app.publish(body)
+                elif handler == "delete":
+                    payload = app.delete(body)
                 else:
                     code, payload = app.cancel(body)
                     self._send_json(code, payload)
@@ -901,7 +1115,7 @@ class ExecutorHTTPServer(ThreadingHTTPServer):
     """带应用状态的多线程 HTTP 服务；只应绑定回环地址。"""
 
     daemon_threads = True
-    allow_reuse_address = True
+    allow_reuse_address = os.name != "nt"
 
     def __init__(self, server_address: tuple[str, int], app: ExecutorApp) -> None:
         self.app = app
@@ -944,11 +1158,44 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=None, help=f"监听端口，默认 {DEFAULT_PORT}")
     parser.add_argument(
         "--mode",
-        choices=("PREPARE_ONLY", "APPROVAL_REQUIRED"),
+        choices=("PREPARE_ONLY", "APPROVAL_REQUIRED", "POLICY_AUTONOMOUS"),
         default=None,
-        help="PREPARE_ONLY（默认，禁止发表）或 APPROVAL_REQUIRED",
+        help="PREPARE_ONLY（默认，禁止发表）、APPROVAL_REQUIRED 或 POLICY_AUTONOMOUS",
     )
-    parser.add_argument("--allow-publish", action="store_true", help="显式允许点击发表（仍需 APPROVAL_REQUIRED）")
+    parser.add_argument("--allow-publish", action="store_true", help="显式允许点击发表（仍需第二或第三档）")
+    parser.add_argument(
+        "--driver",
+        choices=("uia", "geometry"),
+        default=None,
+        help="驱动类型：uia（默认）或 geometry（微信 4.x 几何/像素，opt-in）",
+    )
+    parser.add_argument(
+        "--geometry-allow-publish",
+        action="store_true",
+        help="geometry 驱动显式允许点击发表/删除（仍需 --allow-publish + 第二或第三档）",
+    )
+    parser.add_argument(
+        "--geometry-require-admin",
+        action="store_true",
+        help="强制要求执行器具备管理员权限（默认：仅当微信进程提权时才要求）",
+    )
+    parser.add_argument(
+        "--ocr-python",
+        default=None,
+        help="OCR 使用的 DSH Python 3.12 路径（默认自动探测）",
+    )
+    parser.add_argument(
+        "--max-publish-click-retries",
+        type=int,
+        default=None,
+        help="geometry 点击发表后的有限重试次数（0-2，默认 1）",
+    )
+    parser.add_argument(
+        "--retry-backoff-seconds",
+        type=float,
+        default=None,
+        help="geometry 重试退避秒数（默认 2）",
+    )
     parser.add_argument("--token-file", default=None, help="token 文件；不存在则自动生成")
     parser.add_argument("--screenshot-dir", default=None, help="截图目录")
     parser.add_argument("--asset-root", action="append", default=None, help="允许的素材根目录，可重复")
@@ -985,6 +1232,18 @@ def build_config(args: argparse.Namespace) -> ExecutorConfig:
         overrides["mode"] = args.mode.upper()
     if args.allow_publish:
         overrides["allow_publish"] = True
+    if args.driver is not None:
+        overrides["driver"] = args.driver
+    if args.geometry_allow_publish:
+        overrides["geometry_allow_publish"] = True
+    if args.geometry_require_admin:
+        overrides["geometry_require_admin"] = True
+    if args.ocr_python is not None:
+        overrides["ocr_python"] = os.path.abspath(args.ocr_python)
+    if args.max_publish_click_retries is not None:
+        overrides["max_publish_click_retries"] = args.max_publish_click_retries
+    if args.retry_backoff_seconds is not None:
+        overrides["retry_backoff_seconds"] = args.retry_backoff_seconds
     if args.token_file is not None:
         overrides["token_file"] = os.path.abspath(args.token_file)
     if args.screenshot_dir is not None:
@@ -1055,6 +1314,8 @@ def _install_signal_handlers(server: ExecutorHTTPServer, app: ExecutorApp, logge
 def run_server(config: ExecutorConfig, *, driver: WechatDriver | None = None, logger: logging.Logger | None = None) -> int:
     """启动并阻塞运行服务；供 main 与测试复用。"""
     log = logger or _LOGGER
+    # 几何 profile 使用物理像素：必须在任何窗口/鼠标调用前完成 DPI 感知。
+    log.info("进程 DPI 感知：%s", ensure_dpi_aware())
     token = resolve_runtime_token(config, logger=log)
     try:
         server, app = create_server(config, driver=driver, token=token, logger=log)
@@ -1064,11 +1325,13 @@ def run_server(config: ExecutorConfig, *, driver: WechatDriver | None = None, lo
     _install_signal_handlers(server, app, log)
     host, port = server.server_address[0], server.server_address[1]
     log.info(
-        "桌面执行器已启动：http://%s:%s mode=%s allowPublish=%s",
+        "桌面执行器已启动：http://%s:%s mode=%s driver=%s allowPublish=%s geometryAllowPublish=%s",
         host,
         port,
         config.mode,
+        config.driver,
         config.effective_allow_publish,
+        config.effective_geometry_publish,
     )
     try:
         server.serve_forever(poll_interval=0.2)
@@ -1115,3 +1378,4 @@ def _safe_log_path(path: str | None) -> str:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

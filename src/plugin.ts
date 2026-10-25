@@ -192,7 +192,9 @@ export async function apply(ctx: PluginContextLike, rawConfig: unknown): Promise
     desktop,
     image,
     version,
-    dshVersion: process.env.DSH_DESKTOP_VERSION ?? process.env.DSH_VERSION ?? null,
+    // DSH 0.2.1-rc.3 桌面 Host 注入 DSH_CLIENT_VERSION；旧变量名保留兜底。
+    dshVersion:
+      process.env.DSH_CLIENT_VERSION ?? process.env.DSH_DESKTOP_VERSION ?? process.env.DSH_VERSION ?? null,
   });
 
   // 注册工具

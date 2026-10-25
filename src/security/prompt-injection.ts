@@ -64,12 +64,14 @@ export function extractJsonObject<T>(raw: string, maxLength = 200_000): T {
 
 /** 校验文案是否包含明显的隐私信息。返回风险类型而不是抛错。 */
 export function detectPrivacyRisks(text: string): string[] {
+  // NFKC：全角数字/字母归一，避免「１３８…」这类写法绕过隐私检测。
+  const normalized = text.normalize('NFKC');
   const risks: string[] = [];
-  if (/(1[3-9]\d{9})/.test(text)) risks.push('手机号');
-  if (/\b\d{17}[\dXx]\b/.test(text)) risks.push('身份证号');
-  if (/\b\d{16,19}\b/.test(text)) risks.push('银行卡号');
-  if (/(家庭住址|我家在|住址是|具体地址)/.test(text)) risks.push('家庭住址');
-  if (/(公司地址|工位|办公室在)/.test(text)) risks.push('工作地点');
-  if (/(身份证|护照号|驾驶证号)/.test(text)) risks.push('证件信息');
+  if (/(1[3-9]\d{9})/.test(normalized)) risks.push('手机号');
+  if (/\b\d{17}[\dXx]\b/.test(normalized)) risks.push('身份证号');
+  if (/\b\d{16,19}\b/.test(normalized)) risks.push('银行卡号');
+  if (/(家庭住址|我家在|住址是|具体地址)/.test(normalized)) risks.push('家庭住址');
+  if (/(公司地址|工位|办公室在)/.test(normalized)) risks.push('工作地点');
+  if (/(身份证|护照号|驾驶证号)/.test(normalized)) risks.push('证件信息');
   return risks;
 }

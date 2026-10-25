@@ -368,6 +368,55 @@ class AdminApiClient:
         return raw, mime
 
     # ------------------------------------------------------------------
+    # 社交记忆（chat-memory）管理端点
+    #
+    # 契约见 docs/architecture/chat-memory.md 的「管理 API」一节：
+    # - 默认关闭；只在所有者显式开启后读取 WeChatAgent 白名单内的会话；
+    # - 真实昵称只在所有者本机视图出现，编辑/删除只影响本地印象数据；
+    # - 客户端只调用本机回环管理 API，不接触聊天原文或微信数据库。
+    # ------------------------------------------------------------------
+    def chat_memory(self) -> dict[str, object]:
+        """读取社交记忆总览：设置、统计、会话与人物印象（含本机真实昵称）。"""
+        data = self._api("GET", "/api/chat-memory")
+        return data if isinstance(data, dict) else {}
+
+    def save_chat_memory_settings(self, payload: dict[str, object]) -> dict[str, object]:
+        """保存社交记忆设置子集（enabled / includePrivate / 白名单等），返回完整设置。"""
+        if not isinstance(payload, dict) or not payload:
+            raise ApiError("社交记忆设置不能为空，且必须是 JSON 对象。", kind="config")
+        data = self._api("POST", "/api/chat-memory/settings", body=dict(payload))
+        return data if isinstance(data, dict) else {}
+
+    def sync_chat_memory(self, *, force: bool = False) -> dict[str, object]:
+        """立即同步一次：返回会话数、新消息数、印象更新数与跳过原因。
+
+        同步可能触发本地模型提炼，使用较长的长任务超时；不会重试发表或写入聊天数据。
+        """
+        body: dict[str, object] = {"force": True} if force else {}
+        data = self._api("POST", "/api/chat-memory/sync", body=body, timeout=self.workflow_timeout)
+        return data if isinstance(data, dict) else {}
+
+    def update_chat_member(self, impression_id: str, payload: dict[str, object]) -> dict[str, object]:
+        """所有者修正单条人物印象（别名 / 摘要 / 标签 / 话题 / 风格）。"""
+        if not isinstance(payload, dict) or not payload:
+            raise ApiError("人物印象更新内容不能为空。", kind="config")
+        path = f"/api/chat-memory/members/{urllib.parse.quote(str(impression_id), safe='')}"
+        data = self._api("PATCH", path, body=dict(payload))
+        return data if isinstance(data, dict) else {}
+
+    def delete_chat_member(self, impression_id: str) -> dict[str, object]:
+        """删除单条人物印象（只删本地数据，不修改微信聊天记录）。"""
+        path = f"/api/chat-memory/members/{urllib.parse.quote(str(impression_id), safe='')}"
+        data = self._api("DELETE", path)
+        return data if isinstance(data, dict) else {}
+
+    def purge_chat_conversation(self, conversation_key: str) -> dict[str, object]:
+        """清除整个会话的本机消息与人物印象；返回被删除的 messages / members 数量。"""
+        path = f"/api/chat-memory/conversations/{urllib.parse.quote(str(conversation_key), safe='')}"
+        data = self._api("DELETE", path)
+        return data if isinstance(data, dict) else {}
+
+    # ------------------------------------------------------------------
     # 写入/长任务端点
     # ------------------------------------------------------------------
     def workflow_draft(

@@ -554,7 +554,7 @@ export function buildTools(runtime: MomentsRuntime): ToolDefinitionLike[] {
   tools.push({
     name: 'moments_publish',
     description:
-      '在所有者有效审批前提下执行发表。默认 PREPARE_ONLY 会拒绝；UNCERTAIN 禁止自动重试。只有所有者在管理页/命令中批准后才允许。',
+      '按所有者选择的三级模式发表：仅准备模式拒绝；审批模式需有效审批；免审批模式会准备并发表已审核内容。UNCERTAIN 禁止重发。',
     parameters: {
       type: 'object',
       properties: {
@@ -647,6 +647,89 @@ export function buildTools(runtime: MomentsRuntime): ToolDefinitionLike[] {
       runtime.controlAction('resume', reason, 'owner');
       return { success: true, status: 'RUNNING', message: '已恢复', retryable: false };
     }, 'moments_resume'),
+  });
+
+  tools.push({
+    name: 'moments_sync_chat_memory',
+    description:
+      '同步一次社交记忆：读取所有者聊天范围内允许的群聊/私聊，提炼人物印象。默认关闭时返回 CHAT_MEMORY_DISABLED；不会发送微信消息。',
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
+    output: { schema: envelopeSchema, render: renderEnvelope },
+    timeoutMs: 120_000,
+    execute: wrap(async () => {
+      const result = await runtime.syncChatMemory();
+      return {
+        success: true,
+        status: 'SYNCED',
+        message: `已同步 ${result.conversations} 个会话，新增 ${result.newMessages} 条消息，更新 ${result.impressionsUpdated} 条人物印象`,
+        retryable: false,
+        data: result,
+      };
+    }, 'moments_sync_chat_memory'),
+  });
+
+  tools.push({
+    name: 'moments_get_chat_memory',
+    description:
+      '读取匿名化的社交记忆：会话标签、人物别名、摘要、标签与话题。只读，不含真实昵称、wxid 或聊天原文。',
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
+    output: { schema: envelopeSchema, render: renderEnvelope },
+    execute: wrap(async () => {
+      const view = runtime.agentChatMemoryView();
+      return {
+        success: true,
+        message: view.enabled
+          ? `已读取 ${view.stats.conversations} 个会话、${view.stats.members} 条人物印象`
+          : '社交记忆未启用（chatMemory.enabled=false）',
+        retryable: false,
+        data: view,
+      };
+    }, 'moments_get_chat_memory'),
+  });
+
+  tools.push({
+    name: 'moments_update_member_impression',
+    description:
+      '在已有匿名人物印象上追加/修正观察（摘要、标签、话题、说话风格、别名）。只作用于本地社交记忆，不会发布任何内容。',
+    parameters: {
+      type: 'object',
+      properties: {
+        impressionId: { type: 'string' },
+        summary: { type: 'string', description: '1~2 句人物印象，最多 300 字' },
+        traits: { type: 'array', items: { type: 'string' }, maxItems: 6, description: '受控互动标签，最多 6 个' },
+        topics: { type: 'array', items: { type: 'string' }, maxItems: 8, description: '关心的话题，最多 8 个' },
+        style: { type: 'string', description: '说话风格，最多 120 字' },
+        alias: { type: 'string', description: '提示词中的别名（仅所有者可改；Agent 传了也会被忽略）' },
+      },
+      required: ['impressionId'],
+      additionalProperties: false,
+    },
+    output: { schema: envelopeSchema, render: renderEnvelope },
+    execute: wrap(async (args) => {
+      const impressionId = requiredString(args, 'impressionId', 120);
+      const patch: Record<string, unknown> = {};
+      const summary = optionalString(args, 'summary', 300);
+      const style = optionalString(args, 'style', 120);
+      if (summary !== undefined) patch.summary = summary;
+      if (style !== undefined) patch.style = style;
+      if (args.traits !== undefined) patch.traits = stringArray(args, 'traits', 6).map((item) => item.slice(0, 12));
+      if (args.topics !== undefined) patch.topics = stringArray(args, 'topics', 8).map((item) => item.slice(0, 16));
+      const updated = runtime.updateChatMemberImpression(impressionId, patch, 'agent');
+      return {
+        success: true,
+        message: `已更新人物印象 ${updated.alias}`,
+        retryable: false,
+        data: {
+          impressionId: updated.impressionId,
+          alias: updated.alias,
+          summary: updated.summary,
+          traits: updated.traits,
+          topics: updated.topics,
+          style: updated.style,
+          status: updated.status,
+        },
+      };
+    }, 'moments_update_member_impression'),
   });
 
   return tools;

@@ -1,0 +1,4 @@
+pyinstaller==6.16.0
+rapidocr-onnxruntime==1.4.4
+winsdk==1.0.0b10
+pywinauto==0.6.9

@@ -19,6 +19,7 @@ import abc
 import ctypes
 import logging
 import os
+import threading
 import time
 from typing import Any, Iterable, Sequence
 
@@ -90,6 +91,21 @@ class WechatDriver(abc.ABC):
     def driver_name(self) -> str:
         return type(self).__name__
 
+    @property
+    def driver_kind(self) -> str:
+        """驱动类型标识（供 /wechat/status 暴露）：uia / geometry / fake。"""
+        return "uia"
+
+    @property
+    def requires_uia(self) -> bool:
+        """执行 GUI 操作是否要求 UIA 客户端库；几何驱动不要求。"""
+        return True
+
+    @property
+    def supports_delete(self) -> bool:
+        """是否支持删除已发布朋友圈（仅几何驱动实现）。"""
+        return False
+
     @abc.abstractmethod
     def get_installation(self) -> WechatInstallation:
         """只读检测客户端安装信息。"""
@@ -140,6 +156,33 @@ class WechatDriver(abc.ABC):
     def supports_visibility(self, visibility: str) -> bool:
         """当前客户端是否支持该可见范围。"""
         return visibility in VISIBILITIES
+
+    def matches_expected_text(self, visible_text: str, expected_text: str) -> bool:
+        """比对 OCR/UIA 读回正文与预期正文。
+
+        默认要求规范化后完全一致（UIA 精确读回）；几何驱动会覆盖为
+        “OCR 规范化后包含预期片段”的宽松匹配。
+        """
+        return normalize_text(visible_text) == normalize_text(expected_text)
+
+    def matches_verified_text(self, visible_text: str, expected_text: str) -> bool:
+        """发布后核验的正文匹配口径。
+
+        默认与 ``matches_expected_text`` 相同；几何驱动允许“朋友圈 OCR 片段匹配”
+        （朋友圈信息流可能只显示正文的一部分），但编辑窗口读回仍使用更严格的
+        ``matches_expected_text``。
+        """
+        return self.matches_expected_text(visible_text, expected_text)
+
+    def delete_published(
+        self,
+        expected_text: str,
+        *,
+        evidence_path: str | None = None,
+        timeout: float | None = None,
+    ) -> Any:
+        """删除已发布的朋友圈（仅几何驱动支持，默认拒绝）。"""
+        raise ExecutorError("DESKTOP_UNSUPPORTED", "当前驱动不支持删除已发布朋友圈")
 
     def cancel(self) -> None:
         """请求停止当前操作（默认无状态；真实驱动在步骤间检查）。"""
@@ -873,6 +916,10 @@ class FakeWechatDriver(WechatDriver):
     def uia_available(self) -> bool:
         return True
 
+    @property
+    def driver_kind(self) -> str:
+        return "fake"
+
     def _stage(self, name: str) -> None:
         self.calls.append(name)
         if self.delay_seconds > 0 and self.delay_stage == name:
@@ -1067,6 +1114,41 @@ def _control_identity(control: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 
+_clipboard_write_state = threading.local()
+
+
+def _configure_clipboard_api(user32: Any, kernel32: Any) -> None:
+    """Declare pointer-sized handles explicitly: ctypes otherwise defaults to int32."""
+    pointer = ctypes.c_void_p
+    signatures = (
+        (user32.CreateWindowExW, [ctypes.c_uint, ctypes.c_wchar_p, ctypes.c_wchar_p,
+          ctypes.c_uint, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+          pointer, pointer, pointer, pointer], pointer),
+        (user32.DestroyWindow, [pointer], ctypes.c_int),
+        (user32.OpenClipboard, [pointer], ctypes.c_int),
+        (user32.CloseClipboard, [], ctypes.c_int),
+        (user32.EmptyClipboard, [], ctypes.c_int),
+        (user32.SetClipboardData, [ctypes.c_uint, pointer], pointer),
+        (user32.GetClipboardSequenceNumber, [], ctypes.c_uint),
+        (kernel32.GlobalAlloc, [ctypes.c_uint, ctypes.c_size_t], pointer),
+        (kernel32.GlobalLock, [pointer], pointer),
+        (kernel32.GlobalUnlock, [pointer], ctypes.c_int),
+        (kernel32.GlobalFree, [pointer], pointer),
+    )
+    for function, arguments, result in signatures:
+        function.argtypes = arguments
+        function.restype = result
+
+
+def _open_clipboard_with_retry(user32: Any, owner: Any) -> bool:
+    for attempt in range(20):
+        if user32.OpenClipboard(owner):
+            return True
+        if attempt < 19:
+            time.sleep(0.025)
+    return False
+
+
 def _set_clipboard_text(text: str) -> bool:
     """把文本写入剪贴板；失败返回 False（调用方必须停止，不得继续输入）。"""
     if os.name != "nt":
@@ -1075,31 +1157,49 @@ def _set_clipboard_text(text: str) -> bool:
     kernel32 = _load_kernel32()
     if user32 is None or kernel32 is None:
         return False
-    CF_UNICODETEXT = 13
-    GMEM_MOVEABLE = 0x0002
     opened = False
+    owner = None
+    handle = None
+    transferred = False
+    stage = "initialize"
+    _clipboard_write_state.sequence = None
     try:
-        if not user32.OpenClipboard(None):
-            return False
-        opened = True
-        user32.EmptyClipboard()
+        _configure_clipboard_api(user32, kernel32)
+        # A window owned by this thread is required. OpenClipboard(NULL) followed
+        # by EmptyClipboard leaves no owner and can make SetClipboardData fail.
+        stage = "create-owner"
+        owner = user32.CreateWindowExW(0, "STATIC", "DSH Moments Clipboard", 0,
+                                      0, 0, 0, 0, ctypes.c_void_p(-3), None, None, None)
+        if not owner:
+            raise OSError("CreateWindowExW failed")
         data = text.encode("utf-16-le") + b"\x00\x00"
-        handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+        stage = "allocate"
+        handle = kernel32.GlobalAlloc(0x0002, len(data))
         if not handle:
-            return False
+            raise OSError("GlobalAlloc failed")
         pointer = kernel32.GlobalLock(handle)
         if not pointer:
-            kernel32.GlobalFree(handle)
-            return False
+            raise OSError("GlobalLock failed")
         try:
             ctypes.memmove(pointer, data, len(data))
         finally:
             kernel32.GlobalUnlock(handle)
-        if not user32.SetClipboardData(CF_UNICODETEXT, handle):
-            kernel32.GlobalFree(handle)
-            return False
+        stage = "open"
+        if not _open_clipboard_with_retry(user32, owner):
+            raise OSError("OpenClipboard busy")
+        opened = True
+        stage = "empty"
+        if not user32.EmptyClipboard():
+            raise OSError("EmptyClipboard failed")
+        stage = "set-data"
+        if not user32.SetClipboardData(13, handle):
+            raise OSError("SetClipboardData failed")
+        transferred = True  # Windows owns the HGLOBAL from this point onwards.
+        _clipboard_write_state.sequence = user32.GetClipboardSequenceNumber()
         return True
-    except OSError:
+    except (OSError, ValueError, OverflowError):
+        _LOGGER.warning("剪贴板写入失败 stage=%s winerror=%s", stage,
+                        getattr(ctypes, "get_last_error", lambda: 0)())
         return False
     finally:
         if opened:
@@ -1107,22 +1207,31 @@ def _set_clipboard_text(text: str) -> bool:
                 user32.CloseClipboard()
             except OSError:  # pragma: no cover
                 pass
+        if handle and not transferred:
+            kernel32.GlobalFree(handle)
+        if owner:
+            user32.DestroyWindow(owner)
 
 
 def _clear_clipboard() -> None:
     if os.name != "nt":
         return
     user32 = _load_user32()
-    if user32 is None:
+    sequence = getattr(_clipboard_write_state, "sequence", None)
+    if user32 is None or sequence is None:
         return
     try:
-        if user32.OpenClipboard(None):
+        if _open_clipboard_with_retry(user32, None):
             try:
-                user32.EmptyClipboard()
+                # Never erase something the user copied while automation ran.
+                if user32.GetClipboardSequenceNumber() == sequence:
+                    user32.EmptyClipboard()
             finally:
                 user32.CloseClipboard()
     except OSError:
         pass
+    finally:
+        _clipboard_write_state.sequence = None
 
 
 def _send_ctrl_v() -> None:

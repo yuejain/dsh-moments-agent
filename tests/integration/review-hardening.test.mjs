@@ -180,7 +180,7 @@ test('迁移：持久化命令领取跨数据库重开有效', async () => {
 
 test('人工配图：明确任务目录导入真实 PNG 后自动审核并申请审批', async () => {
   const llm = new MockLlm({ idea: [IDEA_JSON], compose: [COMPOSE_JSON], review: [REVIEW_JSON, REVIEW_JSON] });
-  const ctx = await createTestContext({ llm });
+  const ctx = await createTestContext({ llm, config: { publishMode: 'APPROVAL_REQUIRED' } });
   try {
     const logger = { info() {}, debug() {}, warn() {}, error() {} };
     const image = createImageFacade({ config: ctx.config.images, store: ctx.store, dataDir: ctx.dir, packageRoot: process.cwd(), logger });

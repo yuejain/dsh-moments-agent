@@ -325,6 +325,137 @@ class TestWriteEndpoints(ApiClientTestBase):
         self.assertFalse(unkilled["killSwitch"])
 
 
+class TestChatMemoryEndpoints(ApiClientTestBase):
+    """社交记忆管理端点：默认关闭、可编辑人物印象、可清除会话。"""
+
+    def test_chat_memory_view(self) -> None:
+        view = self.client.chat_memory()
+        self.assertTrue(view["enabled"])
+        self.assertTrue(view["settings"]["enabled"])
+        self.assertFalse(view["settings"]["includePrivate"])
+        self.assertEqual(view["stats"]["members"], 2)
+        self.assertEqual(len(view["conversations"]), 2)
+        group = view["conversations"][0]
+        self.assertEqual(group["conversation"]["kind"], "group")
+        self.assertEqual(group["conversation"]["displayName"], "示例群")
+        self.assertEqual(group["members"][0]["alias"], "群友A")
+        self.assertEqual(group["members"][0]["displayName"], "联系人A")
+        request = self.server.last_request
+        assert request is not None
+        self.assertEqual(request["method"], "GET")
+        self.assertEqual(request["path"], "/api/chat-memory")
+        self.assertEqual(request["headers"]["x-moments-token"], self.server.token)
+
+    def test_chat_memory_default_disabled(self) -> None:
+        self.server.chat_memory_enabled = False
+        self.addCleanup(setattr, self.server, "chat_memory_enabled", True)
+        view = self.client.chat_memory()
+        self.assertFalse(view["enabled"])
+        self.assertFalse(view["settings"]["enabled"])
+        self.assertEqual(view["conversations"], [])
+        self.assertEqual(view["stats"]["messages"], 0)
+
+    def test_save_chat_memory_settings_posts_json(self) -> None:
+        settings = self.client.save_chat_memory_settings({"enabled": True, "includePrivate": True})
+        self.assertTrue(settings["enabled"])
+        self.assertTrue(settings["includePrivate"])
+        request = self.server.last_request
+        assert request is not None
+        self.assertEqual(request["method"], "POST")
+        self.assertEqual(request["path"], "/api/chat-memory/settings")
+        self.assertEqual(request["body"], {"enabled": True, "includePrivate": True})
+
+    def test_save_chat_memory_settings_rejects_empty_payload_without_request(self) -> None:
+        with self.assertRaises(ApiError) as ctx:
+            self.client.save_chat_memory_settings({})
+        self.assertEqual(ctx.exception.kind, "config")
+        self.assertEqual(self.server.requests, [])
+
+    def test_sync_chat_memory(self) -> None:
+        result = self.client.sync_chat_memory()
+        self.assertEqual(result["conversations"], 2)
+        self.assertEqual(result["newMessages"], 6)
+        self.assertEqual(result["impressionsUpdated"], 2)
+        self.assertEqual(result["skipped"][0]["label"], "私聊A")
+        self.assertIn("includePrivate", result["skipped"][0]["reason"])
+        request = self.server.last_request
+        assert request is not None
+        self.assertEqual(request["method"], "POST")
+        self.assertEqual(request["path"], "/api/chat-memory/sync")
+        self.assertEqual(request["body"], {})
+
+    def test_sync_chat_memory_force_sends_flag(self) -> None:
+        self.client.sync_chat_memory(force=True)
+        request = self.server.last_request
+        assert request is not None
+        self.assertEqual(request["body"], {"force": True})
+
+    def test_sync_disabled_maps_to_business_error(self) -> None:
+        self.server.chat_memory_enabled = False
+        self.addCleanup(setattr, self.server, "chat_memory_enabled", True)
+        with self.assertRaises(ApiError) as ctx:
+            self.client.sync_chat_memory()
+        error = ctx.exception
+        self.assert_api_error(error, kind="business", status=200)
+        self.assertEqual(error.error_code, "CHAT_MEMORY_DISABLED")
+        self.assertIn("CHAT_MEMORY_DISABLED", error.user_message())
+
+    def test_update_chat_member_patches_json(self) -> None:
+        result = self.client.update_chat_member(
+            "imp_demo_group_0001",
+            {"alias": "群友C", "summary": "修正后的摘要", "traits": ["热心"], "topics": ["效率工具"]},
+        )
+        self.assertEqual(result["impressionId"], "imp_demo_group_0001")
+        self.assertEqual(result["alias"], "群友C")
+        self.assertEqual(result["status"], "owner_edited")
+        request = self.server.last_request
+        assert request is not None
+        self.assertEqual(request["method"], "PATCH")
+        self.assertEqual(request["path"], "/api/chat-memory/members/imp_demo_group_0001")
+        self.assertEqual(request["body"]["alias"], "群友C")
+        self.assertEqual(request["body"]["traits"], ["热心"])
+        self.assertTrue(request["headers"]["content-type"].startswith("application/json"))
+
+    def test_delete_chat_member_encodes_impression_id(self) -> None:
+        self.client.delete_chat_member("imp/空格 1")
+        request = self.server.last_request
+        assert request is not None
+        self.assertEqual(request["method"], "DELETE")
+        self.assertEqual(request["path"], "/api/chat-memory/members/imp%2F%E7%A9%BA%E6%A0%BC%201")
+
+    def test_update_chat_member_rejects_empty_payload_without_request(self) -> None:
+        with self.assertRaises(ApiError) as ctx:
+            self.client.update_chat_member("imp_demo_group_0001", {})
+        self.assertEqual(ctx.exception.kind, "config")
+        self.assertEqual(self.server.requests, [])
+
+    def test_delete_chat_member(self) -> None:
+        result = self.client.delete_chat_member("imp_demo_group_0001")
+        self.assertTrue(result["deleted"])
+        request = self.server.last_request
+        assert request is not None
+        self.assertEqual(request["method"], "DELETE")
+        self.assertEqual(request["path"], "/api/chat-memory/members/imp_demo_group_0001")
+        self.assertEqual(request["headers"]["x-moments-token"], self.server.token)
+
+    def test_purge_chat_conversation(self) -> None:
+        result = self.client.purge_chat_conversation("conv_demo_group_0001")
+        self.assertEqual(result["messages"], 12)
+        self.assertEqual(result["members"], 2)
+        request = self.server.last_request
+        assert request is not None
+        self.assertEqual(request["method"], "DELETE")
+        self.assertEqual(request["path"], "/api/chat-memory/conversations/conv_demo_group_0001")
+
+    def test_chat_memory_business_error_mapping(self) -> None:
+        self.server.business_error = {"message": "会话不存在", "errorCode": "CHAT_CONVERSATION_NOT_FOUND"}
+        with self.assertRaises(ApiError) as ctx:
+            self.client.purge_chat_conversation("conv_missing")
+        error = ctx.exception
+        self.assert_api_error(error, kind="business", status=200)
+        self.assertEqual(error.error_code, "CHAT_CONVERSATION_NOT_FOUND")
+
+
 class TestErrorMapping(ApiClientTestBase):
     def test_401_maps_to_auth_error(self) -> None:
         self._write_token(secrets.token_hex(32))

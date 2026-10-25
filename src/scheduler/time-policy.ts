@@ -79,7 +79,7 @@ export function isQuietHours(now: Date, quietHours: readonly [string, string], t
 }
 
 /** 当前时区偏移（毫秒，东八区为 +8h）。 */
-function timeZoneOffsetMs(now: Date, timeZone: string): number {
+export function timeZoneOffsetMs(now: Date, timeZone: string): number {
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone,
     timeZoneName: 'longOffset',

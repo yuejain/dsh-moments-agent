@@ -1,0 +1,9 @@
+# 客户端本地配置（含本机路径，不提交）
+moments-client.json
+
+# 测试临时目录（DSH Python 3.12 沙箱下可能留下 ACL 受限的空目录）
+tests/.tmp/
+
+# Python 缓存
+__pycache__/
+*.pyc
