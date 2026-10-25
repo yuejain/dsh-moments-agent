@@ -36,7 +36,7 @@ class EmbeddedExecutorTest(unittest.TestCase):
         self.assertEqual(config.trusted_account_source, "wechatagent")
         self.assertFalse(config.effective_allow_publish)
         self.assertFalse(config.effective_geometry_publish)
-        self.assertEqual(config.asset_roots, (str(Path(self.tmp.name) / "assets"),))
+        self.assertEqual(config.asset_roots, (str((Path(self.tmp.name) / "assets").resolve()),))
         self.args.allow_publish = True
         config = server.build_executor_config(self.args)
         self.assertTrue(config.effective_geometry_publish)

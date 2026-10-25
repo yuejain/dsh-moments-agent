@@ -18,7 +18,7 @@ class DiscoveryTest(unittest.TestCase):
             self.assertNotIn('PRIVATE',json.dumps(found))
     def test_detects_running_programs_registered_plugin_and_redacts_secrets(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             plugin = root / '.dsh/profiles/desktop/node_modules/dsh-moments-agent'
             plugin.mkdir(parents=True)
             (plugin/'package.json').write_text(json.dumps({'name':'dsh-moments-agent'}))
