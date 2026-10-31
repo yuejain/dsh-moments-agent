@@ -209,7 +209,7 @@ class ExecutorApp:
             "桌面执行器初始化：%s",
             json.dumps(describe_config(config), ensure_ascii=False),
         )
-        if not self._driver.uia_available:
+        if getattr(self._driver, "requires_uia", True) and not self._driver.uia_available:
             self.logger.warning("UI Automation 客户端库不可用，真实 GUI 操作将被拒绝（DESKTOP_UNSUPPORTED）")
 
     # -- 生命周期 ---------------------------------------------------------
@@ -275,7 +275,7 @@ class ExecutorApp:
             else:
                 message = (
                     f"微信客户端已安装（{installation.version or '版本未知'}）；"
-                    "geometry 驱动（几何/像素/OCR）已授权，真实发布仍需一次性审批且未完成 NOT_TESTED 验收"
+                    f"geometry 驱动与 OCR 已就绪；发表模式 {self.config.mode}，执行时仍需核对账号、内容与桌面状态"
                 )
         elif not uia_available:
             message = (

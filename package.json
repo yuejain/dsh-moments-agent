@@ -1,6 +1,6 @@
 {
   "name": "dsh-moments-agent",
-  "version": "0.3.0",
+  "version": "0.3.2",
   "private": true,
   "description": "DSH Moments Agent：以 DeepSeek Harness 为底座、面向 Windows 个人微信朋友圈的数字化人格创作与审批发布插件",
   "license": "MIT",

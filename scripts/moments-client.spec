@@ -18,4 +18,4 @@ a = Analysis([str(root / 'scripts/exe-entry.py')], pathex=[str(root)],
 pyz = PYZ(a.pure)
 exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name='DSH-Moments-Client',
           console=False, uac_admin=True, upx=False, manifest=str(root / 'scripts/moments-client.manifest'))
-coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name='DSH-Moments-Client-1.2.0-win64-exe')
+coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name='DSH-Moments-Client-1.2.3-win64-exe')

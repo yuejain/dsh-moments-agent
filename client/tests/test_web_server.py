@@ -722,8 +722,8 @@ class WebServerTest(unittest.TestCase):
 
     # -- 首次启动自动配置引导（client/auto_configure.py 整体替换，绝不触真实文件/网络） -----
 
-    def test_version_is_1_2_0(self):
-        self.assertEqual(client_server.VERSION, "1.2.0")
+    def test_version_is_1_2_3(self):
+        self.assertEqual(client_server.VERSION, "1.2.3")
 
     def test_browser_url_marks_first_run_without_changing_route(self):
         self.assertEqual(client_server.browser_url(18770, False), "http://127.0.0.1:18770/")
@@ -749,6 +749,10 @@ class WebServerTest(unittest.TestCase):
         self.assertFalse(status["firstRun"])
         self.assertFalse(status["configMissing"])
         self.assertTrue(status["setupCompleted"])
+
+        client_server.CONFIG_PATH.unlink()
+        self.assertTrue(client_server.first_run_status()["configMissing"])
+        self.assertFalse(client_server.first_run_status()["firstRun"])
 
     def test_first_run_endpoint_reports_config_missing_and_detects(self):
         module = fake_auto_configure_module()

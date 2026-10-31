@@ -8,7 +8,7 @@ $python = Join-Path $root '.tmp\exe-build-env\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $python)) { throw 'Create .tmp/exe-build-env and install scripts/exe-requirements.txt first.' }
 & $python -m PyInstaller --noconfirm --distpath (Join-Path $root 'release') --workpath (Join-Path $root '.tmp\exe-build') (Join-Path $PSScriptRoot 'moments-client.spec')
 if ($LASTEXITCODE -ne 0) { throw 'EXE build failed.' }
-$destination = Join-Path $root 'release\DSH-Moments-Client-1.2.0-win64-exe'
+$destination = Join-Path $root 'release\DSH-Moments-Client-1.2.3-win64-exe'
 Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination $destination -Force
 New-Item -ItemType Directory -Path (Join-Path $destination 'client') -Force | Out-Null
 # Relative paths are resolved against the EXE directory when frozen. The first-run

@@ -320,3 +320,16 @@ test('WeChatAgent 适配器：未启用时不发起会话读取请求', async ()
   assert.deepEqual(await adapter.listConversationMessages('123@chatroom', 10), []);
   assert.equal(called, 0);
 });
+
+test('无微信审批接收人时仍验证 Reader 和 Hook 身份，不能发送审批通知', async () => {
+  const fetchImpl = async url => url.includes('/api/v1/reader/status') ? jsonResponse(readerStatus) : jsonResponse(hookHealth);
+  const adapter = new WeChatAgentHttpAdapter({config:config({ownerWxid:''}),fetchImpl,env:{DSH_MOMENTS_READER_TOKEN:'r',DSH_MOMENTS_HOOK_TOKEN:'h'}});
+  assert.equal((await adapter.checkIdentityHealth()).status, 'ok');
+  assert.equal((await adapter.checkHealth()).status, 'degraded');
+  await assert.rejects(adapter.sendText('test'));
+});
+test('无审批接收人时 Hook 与 Reader 不一致仍不能通过身份核验', async () => {
+  const fetchImpl = async url => url.includes('/api/v1/reader/status') ? jsonResponse(readerStatus) : jsonResponse({...hookHealth,databaseAccounts:['other']});
+  const adapter = new WeChatAgentHttpAdapter({config:config({ownerWxid:''}),fetchImpl,env:{DSH_MOMENTS_READER_TOKEN:'r',DSH_MOMENTS_HOOK_TOKEN:'h'}});
+  assert.equal((await adapter.checkIdentityHealth()).status, 'degraded');
+});

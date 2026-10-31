@@ -148,6 +148,11 @@ if _IS_WINDOWS and _user32 is not None and _kernel32 is not None and _gdi32 is n
         if hasattr(_user32, "SetProcessDpiAwarenessContext"):
             _user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
             _user32.SetProcessDpiAwarenessContext.restype = ctypes.c_bool
+        if hasattr(_user32, "GetThreadDpiAwarenessContext"):
+            _user32.GetThreadDpiAwarenessContext.argtypes = []
+            _user32.GetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+            _user32.AreDpiAwarenessContextsEqual.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            _user32.AreDpiAwarenessContextsEqual.restype = ctypes.c_bool
         if hasattr(_user32, "SetProcessDPIAware"):
             _user32.SetProcessDPIAware.argtypes = []
             _user32.SetProcessDPIAware.restype = ctypes.c_bool
@@ -234,6 +239,22 @@ def ensure_dpi_aware() -> str:
     if not _IS_WINDOWS or _user32 is None:  # pragma: no cover - 非 Windows
         _dpi_awareness = "unsupported"
         return _dpi_awareness
+    # A manifest can already have selected PMv2. Setting it again fails with
+    # ACCESS_DENIED; do not call the legacy setter and misreport system-aware.
+    def current_awareness():
+        try:
+            context = _user32.GetThreadDpiAwarenessContext()
+            for value, name in ((-4, "per-monitor-v2"), (-3, "per-monitor"), (-2, "system-aware")):
+                if _user32.AreDpiAwarenessContextsEqual(context, ctypes.c_void_p(value)):
+                    return name
+        except (OSError, AttributeError):
+            pass
+        return None
+
+    existing = current_awareness()
+    if existing == "per-monitor-v2":
+        _dpi_awareness = existing
+        return _dpi_awareness
     try:
         if hasattr(_user32, "SetProcessDpiAwarenessContext") and _user32.SetProcessDpiAwarenessContext(
             ctypes.c_void_p(_DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
@@ -242,6 +263,10 @@ def ensure_dpi_aware() -> str:
             return _dpi_awareness
     except (OSError, AttributeError):  # pragma: no cover - 旧系统
         pass
+    existing = current_awareness()
+    if existing is not None:
+        _dpi_awareness = existing
+        return _dpi_awareness
     try:
         if hasattr(_user32, "SetProcessDPIAware") and _user32.SetProcessDPIAware():
             _dpi_awareness = "system-aware"

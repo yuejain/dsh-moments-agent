@@ -112,6 +112,7 @@ export interface WechatChatMessage {
  * 不假设存在 sendImage / publishMoments 等未公开方法。
  */
 export interface WeChatAgentAdapter {
+  checkIdentityHealth?(): Promise<AdapterHealth>;
   checkHealth(): Promise<AdapterHealth>;
   /** 当前微信账号；未验证时返回 null，绝不返回配置里“声称”的账号。 */
   getAccount(): Promise<{ accountId: string; ownWxid: string } | null>;
@@ -137,6 +138,11 @@ export interface DesktopHealth {
   readonly allowPublish: boolean;
   readonly mode: string;
   readonly message: string;
+  readonly driver?: string;
+  readonly ocrAvailable?: boolean;
+  readonly adminPrivilege?: boolean;
+  readonly geometryRequireAdmin?: boolean;
+  readonly processDpiAwareness?: string | null;
 }
 
 export interface WechatClientStatus {

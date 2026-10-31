@@ -1,3 +1,5 @@
+> 当前配套版本：客户端 1.2.3 / 插件 0.3.2。升级时将旧包 client/moments-client.json 和 client/setup-state.json 复制到新包的 client 目录，保留连接和首次配置进度。1.2.3 的发表等待提示尚未完成真实发表复测；1.2.2 曾完成实机纯文字发表。详见 [0.3.2 发布说明](https://github.com/yuejain/dsh-moments-agent/blob/main/docs/releases/v0.3.2.md)。
+
 # Windows EXE 1.2.0
 
 本版配套 **DSH 插件 0.3.0**，在保留 1.1.9 几何发布链路的基础上，重点解决"新用户第一次打开怎么配置"，并接入社交记忆管理。

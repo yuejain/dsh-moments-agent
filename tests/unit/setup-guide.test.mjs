@@ -14,10 +14,10 @@ const sandbox = { state: { setup: { available: true } }, modeText: (value) => va
 vm.createContext(sandbox);
 vm.runInContext(`${guide}\n${extract('emptySetupData')}\n${extract('normalizeSetupData')}\n${extract('computeSetupChecks')}\nthis.steps=SETUP_STEPS;this.ids=SETUP_STEP_IDS;`, sandbox);
 
-test('old proxy progress cannot mark the revised onboarding complete', () => {
+test('explicitly saved completion survives older or partial progress', () => {
   const steps = Object.fromEntries(sandbox.ids.filter((id) => id !== 'model').map((id) => [id, true]));
   steps.proxy = true;
-  assert.equal(sandbox.normalizeSetupData({ completed: true, steps }).completed, false);
+  assert.equal(sandbox.normalizeSetupData({ completed: true, steps }).completed, true);
 });
 
 test('setup does not treat publish permission as evidence of OCR or administrator readiness', () => {
@@ -33,7 +33,8 @@ test('setup does not treat publish permission as evidence of OCR or administrato
 });
 
 test('guide uses owner-supplied identity and EXE launch flow', () => {
-  assert.equal(sandbox.steps.length, 8);
+  assert.equal(sandbox.steps.length, 6);
   assert.equal(/wxid_1a7|FengWo|Fake-IP|Clash|desktop\\server\.py --/.test(guide), false);
-  assert.ok(sandbox.steps.find((step) => step.id === 'firstpost').blocks.some((block) => block.code?.includes('DSH-Moments-Client.exe')));
+  assert.ok(sandbox.steps.find((step) => step.id === 'executor'));
+  assert.equal(sandbox.steps.some((step) => step.id === 'firstpost'), false);
 });

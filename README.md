@@ -8,20 +8,26 @@
 
 ## 最新下载
 
-当前配套版本：**插件 0.3.0 / Windows 客户端 1.2.0**，发布于 2026-10-25。
+当前配套版本：**插件 0.3.2 / Windows 客户端 1.2.3**，发布于 2026-10-31。
 
 | 下载 | 用途 |
 | --- | --- |
-| [Windows EXE 便携包](https://github.com/yuejain/dsh-moments-agent/releases/download/v0.3.0/DSH-Moments-Client-1.2.0-win64-exe.zip) | 管理界面、首次启动引导、内置桌面执行器、OCR；无需另装 Python |
-| [DSH 插件包](https://github.com/yuejain/dsh-moments-agent/releases/download/v0.3.0/dsh-moments-agent-0.3.0.tgz) | 安装到 DSH，负责模型、记忆、任务、审核、审批和调度 |
-| [SHA256 校验值](https://github.com/yuejain/dsh-moments-agent/releases/download/v0.3.0/DSH-Moments-Client-1.2.0-SHA256SUMS.txt) | 校验 EXE、ZIP 和插件包 |
-| [完整发布页面](https://github.com/yuejain/dsh-moments-agent/releases/tag/v0.3.0) | 更新说明、静态包验证和签名信息 |
+| [Windows EXE 便携包](https://github.com/yuejain/dsh-moments-agent/releases/download/v0.3.2/DSH-Moments-Client-1.2.3-win64-exe.zip) | 管理界面、首次启动引导、内置桌面执行器、OCR；无需另装 Python |
+| [DSH 插件包](https://github.com/yuejain/dsh-moments-agent/releases/download/v0.3.2/dsh-moments-agent-0.3.2.tgz) | 安装到 DSH，负责模型、记忆、任务、审核、审批和调度 |
+| [SHA256 校验值](https://github.com/yuejain/dsh-moments-agent/releases/download/v0.3.2/DSH-Moments-Client-1.2.3-SHA256SUMS.txt) | 校验 EXE、ZIP 和插件包 |
+| [完整发布页面](https://github.com/yuejain/dsh-moments-agent/releases/tag/v0.3.2) | 更新说明、静态包验证和签名信息 |
 
 **插件和客户端请成对升级。** EXE 不包含 DSH 主程序，也不能替代 DSH 插件。便携包需完整解压，保留 `_internal` 目录。
 
 EXE 使用本地自签名证书进行 SHA256 Authenticode 签名，并附 DigiCert 时间戳；自签名不会自动成为其他电脑信任的发布者。私钥不随包分发。
 
 ## 这一版更新了什么
+
+- **执行器连接与账号修复**：诊断插件连接、令牌、管理员权限和 OCR；区分 Reader/Hook 身份验证与微信审批通知接收人。
+- **首次配置和概览**：保留已有设置并记录完成状态；环境自检与常见问题放到概览。
+- **发表反馈**：直接发表时显示等待状态并禁止重复点击。
+- **验证边界**：1.2.2 / 0.3.2 曾在本机完成一次真实纯文字朋友圈发表及 OCR 核验；1.2.3 的等待提示已回归测试，但尚未完成同等实机发表及重启复测。
+
 
 - **首次启动自动配置**：读取本机 DSH profile、插件位置、WeChatAgent 连接、账号和模型，展示预览；所有者确认后先备份，再写入选中插件条目，并同步客户端连接。
 - **社交记忆**：显式开启后，在白名单聊天范围内读取群聊/私聊，提炼匿名人物印象，作为选题与创作的弱参考；默认关闭，私聊需单独允许。

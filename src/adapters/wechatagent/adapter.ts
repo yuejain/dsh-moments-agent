@@ -191,11 +191,16 @@ export class WeChatAgentHttpAdapter implements WeChatAgentAdapter {
   }
 
   async checkHealth(): Promise<AdapterHealth> {
+    const identity = await this.checkIdentityHealth();
+    if (identity.status === 'ok' && this.config.ownerWxid === '') {
+      return { status: 'degraded', message: 'Reader 与 Hook 账号一致；未配置 ownerWxid，微信审批通知不可用', details: identity.details };
+    }
+    return identity;
+  }
+
+  async checkIdentityHealth(): Promise<AdapterHealth> {
     if (!this.config.enabled) {
       return { status: 'not_configured', message: 'WeChatAgent 适配器未启用（wechatAgent.enabled=false）' };
-    }
-    if (this.config.ownerWxid === '') {
-      return { status: 'degraded', message: '未配置 ownerWxid，无法绑定审批人' };
     }
     try {
       const reader = await this.readerStatus();

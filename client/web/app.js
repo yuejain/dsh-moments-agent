@@ -219,9 +219,9 @@
   const SETUP_WECHATBOT = 'D:\\wechatbot';
   const SETUP_ACCOUNT = '你的真实 wxid';
   const SETUP_CLIENT_VERSION = '4.1.10.27';
-  const SETUP_STEP_IDS = ['plugin', 'model', 'wechatagent', 'account', 'executor', 'config', 'approval', 'firstpost'];
+  const SETUP_STEP_IDS = ['plugin', 'model', 'wechatagent', 'account', 'executor', 'config'];
 
-  const SETUP_STEPS = [
+  const ALL_SETUP_STEPS = [
     {
       id: 'plugin', letter: '01', title: '准备程序与数据目录',
       summary: '确认 EXE、DSH 插件、配置文件分别放在哪里。',
@@ -387,6 +387,7 @@ Start-Process -FilePath '.\DSH-Moments-Client.exe' -Verb RunAs`, note: '启动�
     },
   ];
 
+  const SETUP_STEPS = ALL_SETUP_STEPS.filter((step) => SETUP_STEP_IDS.includes(step.id));
   const SETUP_ERROR_ROWS = [
     { code: 'TOKEN_MISSING', symptom: '能打开页面但无法读取数据', cause: '客户端管理令牌路径缺失或不可读', fix: '第 01 步核对 tokenFile 与 DSH adminServer.tokenFile；只填写路径，重载插件后重启 EXE。' },
     { code: 'ADMIN_API_UNREACHABLE', symptom: '插件管理 API 无响应', cause: 'DSH 未运行、插件未加载或地址错误', fix: '先打开 DSH 并确认插件启用，检查 18766 与管理地址。' },
@@ -699,6 +700,8 @@ Start-Process -FilePath '.\DSH-Moments-Client.exe' -Verb RunAs`, note: '启动�
     discovery: (refresh = false) => request('/api/client/discovery' + (refresh ? '?refresh=1' : ''), {timeout:10000}),
     locateControls: () => request('/api/client/locate-controls', {timeout:45000}),
     executorInfo: () => request('/api/client/executor', { timeout: 20000 }),
+    connectExecutor: (enabled, baseUrl) => request('/proxy/api/desktop-connection', {
+      method: 'POST', body: { enabled, baseUrl }, timeout: 15000 }),
     setPublishMode: (mode, expectedMode) => request('/api/client/publish-mode', { method: 'POST', headers: { 'X-Requested-With': 'DSHMomentsClient' }, body: { mode, expectedMode }, timeout: 12000 }),
     clientConfig: () => request('/api/client/config', { timeout: 8000 }),
     saveClientConfig: (payload) => request('/api/client/config', { method: 'POST', body: payload }),
@@ -1588,7 +1591,11 @@ Start-Process -FilePath '.\DSH-Moments-Client.exe' -Verb RunAs`, note: '启动�
     grid2.appendChild(h('div', { class: 'col-7' }, buildRecentTasksCard()));
     grid2.appendChild(h('div', { class: 'col-5' }, buildReminderCard()));
     root.appendChild(grid2);
+    root.appendChild(h('div', { id: 'setup-check-slot' }, buildSetupSelfCheckCard()));
+    root.appendChild(buildAutonomyPlanCard());
+    root.appendChild(buildSetupErrorsCard());
     page.replaceChildren(root);
+    if (state.setup.check.status === 'idle') runSetupSelfCheck();
   }
 
   function buildHero() {
@@ -2722,6 +2729,7 @@ Start-Process -FilePath '.\DSH-Moments-Client.exe' -Verb RunAs`, note: '启动�
     return card;
   }
 
+  const publishingTasks = new Set();
   function buildTaskActionDefs({ stateValue, terminal, latestAttempt, publishMode }) {
     const taskId = state.taskSel;
     const publishBlocked = !['APPROVAL_REQUIRED', 'POLICY_AUTONOMOUS'].includes(publishMode);
@@ -2754,7 +2762,7 @@ Start-Process -FilePath '.\DSH-Moments-Client.exe' -Verb RunAs`, note: '启动�
       {
         // PREPARE_ONLY 下禁用「发表」，避免让人误以为可以真的发布；
         // openPublishModal 里的后端错误展示路径保持不变（APPROVAL_REQUIRED 等模式下仍会使用）。
-        label: publishMode === 'POLICY_AUTONOMOUS' ? '直接发表' : '发表', icon: 'send', enabled: !publishBlocked && (stateValue === 'PREPARED' || (publishMode === 'POLICY_AUTONOMOUS' && ['READY_FOR_APPROVAL', 'READY_TO_PUBLISH', 'APPROVED', 'QUEUED'].includes(stateValue))),
+        label: publishingTasks.has(taskId) ? '正在发表…' : publishMode === 'POLICY_AUTONOMOUS' ? '直接发表' : '发表', icon: 'send', enabled: !publishingTasks.has(taskId) && !publishBlocked && (stateValue === 'PREPARED' || (publishMode === 'POLICY_AUTONOMOUS' && ['READY_FOR_APPROVAL', 'READY_TO_PUBLISH', 'APPROVED', 'QUEUED'].includes(stateValue))),
         tone: 'warn',
         disabledReason: publishBlockedReason,
         run: () => openPublishModal(taskId),
@@ -3149,10 +3157,19 @@ Start-Process -FilePath '.\DSH-Moments-Client.exe' -Verb RunAs`, note: '启动�
   function openPublishModal(taskId) {
     const selectedMode = (state.config && state.config.publishMode) || (state.health && state.health.publishMode);
     if (selectedMode === 'POLICY_AUTONOMOUS') {
+      if (publishingTasks.has(taskId)) return;
+      publishingTasks.add(taskId);
+      // The initiating control is retained when the task view is refreshed.
+      for (const item of document.querySelectorAll('.task-actions button')) {
+        if (item.textContent.trim() === '直接发表') { item.disabled = true; item.textContent = '正在发表…'; }
+      }
+      toast('正在发表', '正在执行并核验结果，请勿重复操作。', 'info');
       api.publish(taskId).then((result) => {
         toast('直接发表已返回', result.message || '请核对发表结果', result.uncertain ? 'warn' : 'success');
+      }).catch((error) => { toast('直接发表未完成', describeError(error).detail, 'error'); }).finally(() => {
+        publishingTasks.delete(taskId);
         refreshCurrent(true);
-      }).catch((error) => { toast('直接发表未完成', describeError(error).detail, 'error'); refreshCurrent(true); });
+      });
       return;
     }
     const summary = taskById(taskId);
@@ -3349,7 +3366,6 @@ Start-Process -FilePath '.\DSH-Moments-Client.exe' -Verb RunAs`, note: '启动�
     base.completedAt = typeof raw.completedAt === 'string' && raw.completedAt !== '' ? raw.completedAt : null;
     const steps = raw.steps && typeof raw.steps === 'object' ? raw.steps : {};
     for (const id of SETUP_STEP_IDS) base.steps[id] = steps[id] === true;
-    base.completed = base.completed && SETUP_STEP_IDS.every((id) => base.steps[id]);
     if (!base.completed) base.completedAt = null;
     return base;
   }
@@ -3443,7 +3459,7 @@ Start-Process -FilePath '.\DSH-Moments-Client.exe' -Verb RunAs`, note: '启动�
       state.setup.data = normalizeSetupData(saved);
       state.setup.available = true;
       state.setup.error = null;
-      state.setup.wizardIndex = 9;
+      state.setup.wizardIndex = SETUP_STEPS.length + 1;
       state.setup.sessionSkip = true;
       toast('配置教程已完成', '以后启动不会再自动弹出；可以随时从左侧「首次配置」重新打开。', 'success', { duration: 6000 });
     } catch (error) {
@@ -3486,11 +3502,7 @@ Start-Process -FilePath '.\DSH-Moments-Client.exe' -Verb RunAs`, note: '启动�
     const root = h('div', { class: 'page' });
     root.appendChild(buildSetupHero());
     if (state.setup.data && state.setup.data.completed) root.appendChild(buildSetupCompleteCard());
-    const checkHost = h('div', { id: 'setup-check-slot' });
-    root.appendChild(checkHost);
     root.appendChild(buildSetupLayout());
-    root.appendChild(buildAutonomyPlanCard());
-    root.appendChild(buildSetupErrorsCard());
     page.replaceChildren(root);
     renderSetupCheckSlot();
   }
@@ -3541,11 +3553,11 @@ Start-Process -FilePath '.\DSH-Moments-Client.exe' -Verb RunAs`, note: '启动�
       actions.appendChild(h('a', { class: 'btn btn-primary btn-lg', href: '#/dashboard' }, icon('arrow-right', 16), '进入概览'));
     }
 
-    const eyebrow = h('div', { class: 'hero-eyebrow' }, statusDot(completed ? 'ok' : 'warn'), completed ? 'ONBOARDING · COMPLETED' : 'GET STARTED · 8 STEPS');
+    const eyebrow = h('div', { class: 'hero-eyebrow' }, statusDot(completed ? 'ok' : 'warn'), completed ? 'ONBOARDING · COMPLETED' : `GET STARTED · ${total} STEPS`);
     const title = h('h2', { class: 'hero-title' }, completed ? '配置清单已完成，请以验收结果为准。' : '把每一步配置，落到可验证的结果。');
     const desc = h('p', { class: 'hero-desc' }, completed
       ? `全部 ${total} 步已完成${data.completedAt ? `（${fmtDateTime(data.completedAt)}）` : ''}。随时可以回来复习命令与排查方法；真实发布仍受一次性审批与执行器开关约束。`
-      : '准备程序 → 模型与人格 → WeChatAgent → 账号绑定 → 执行器验收 → 完整配置 → 只准备演练 → 真实发表。逐步操作、核对，再进入下一步。');
+      : '准备程序 → 模型与人格 → WeChatAgent → 账号绑定 → 执行器 → 完整配置。日常自检与发表说明在概览中查看。');
 
     const progress = h('div', { class: 'setup-progress' },
       h('div', { class: 'setup-progress-head' },
@@ -4206,7 +4218,7 @@ Start-Process -FilePath '.\DSH-Moments-Client.exe' -Verb RunAs`, note: '启动�
     const errors = Array.isArray(summary.errors) ? summary.errors : [];
     return Boolean(
       info && info.firstRun === true && info.needsAutoConfigure === true
-      && errors.length === 0 && Object.keys(summary).length > 0,
+      && summary.existed !== true && errors.length === 0 && Object.keys(summary).length > 0,
     );
   }
 
@@ -4338,6 +4350,14 @@ Start-Process -FilePath '.\DSH-Moments-Client.exe' -Verb RunAs`, note: '启动�
       actions.push({ label: '前往第 06 步', class: 'btn btn-outline', iconName: 'terminal', onClick: goToManualConfigTutorial });
       actions.push({ label: '关闭', class: 'btn btn-primary' });
     } else {
+      actions.push({ label: '保留现有设置并完成', class: 'btn btn-outline', iconName: 'check', onClick: async () => {
+        try {
+          state.setup.data = normalizeSetupData(await api.saveSetupState({ completed: true }));
+          state.firstrun.info = { ...state.firstrun.info, firstRun: false, setupCompleted: true };
+          rememberFirstRunDismiss();
+          toast('首次配置已记录', '保留原有连接、发表模式与调度设置；可在概览中检查环境。', 'success');
+        } catch (error) { setupPersistErrorToast(error); return false; }
+      } });
       actions.push({
         label: '稍后',
         class: 'btn btn-ghost',
@@ -4368,7 +4388,7 @@ Start-Process -FilePath '.\DSH-Moments-Client.exe' -Verb RunAs`, note: '启动�
           disabled: !applyEnabled,
           title: applyEnabled
             ? '先弹出二次确认；确认后才备份并写入，绝不静默写文件'
-            : '当前检测结果不满足自动写入条件，请按手工教程配置',
+            : '已有插件配置或检测条件不满足；保留现有设置，可按教程手工检查',
           onClick: () => {
             closeFirstRunModal();
             openFirstRunApplyConfirm();
@@ -4429,11 +4449,16 @@ Start-Process -FilePath '.\DSH-Moments-Client.exe' -Verb RunAs`, note: '启动�
       profileName: '',
       // 取消/关闭二次确认时回到欢迎引导，不静默写入任何文件。
       onCancel: () => renderFirstRunWelcome(),
-      onApplied: (result) => {
+      onApplied: async (result) => {
         state.firstrun.applied = autoConfigPlainObject(result);
         state.firstrun.pollCount = 0;
-        // 已写入后不再每次启动自动弹出；仍可从「首次配置」页重新打开。
-        rememberFirstRunDismiss();
+        try {
+          state.setup.data = normalizeSetupData(await api.saveSetupState({ completed: true }));
+          state.firstrun.info = { ...state.firstrun.info, firstRun: false, setupCompleted: true };
+          rememberFirstRunDismiss();
+        } catch (error) {
+          setupPersistErrorToast(error);
+        }
         const backup = autoConfigText(state.firstrun.applied.backupPath) !== '—'
           ? `备份：${state.firstrun.applied.backupPath}` : '请到 profile 目录核对 .bak 备份。';
         toast('配置已写入', `${backup}；请重启 DSH 后生效。`, 'success', { duration: 9000 });
@@ -4789,7 +4814,7 @@ Start-Process -FilePath '.\DSH-Moments-Client.exe' -Verb RunAs`, note: '启动�
         h('span', { class: 'setup-wizard-logo' }, icon('compass', 18)),
         h('div', {},
           h('strong', {}, '第一次配置'),
-          h('span', {}, '从零到第一条真实朋友圈 · 8 步'),
+          h('span', {}, `首次连接 · ${SETUP_STEPS.length} 步`),
         ),
       ),
       h('div', { class: 'setup-wizard-progress' },
@@ -4972,9 +4997,10 @@ Start-Process -FilePath '.\DSH-Moments-Client.exe' -Verb RunAs`, note: '启动�
       api.writingSkills(),
       api.discovery(),
       api.chatMemory(),
+      api.executorInfo(),
     ]);
     if (token !== renderSeq) return;
-    const [clientInfoResult, clientConfigResult, personaResult, configResult, healthResult, statusResult, setupResult, automationResult, writingSkillsResult, discoveryResult, chatMemoryResult] = results;
+    const [clientInfoResult, clientConfigResult, personaResult, configResult, healthResult, statusResult, setupResult, automationResult, writingSkillsResult, discoveryResult, chatMemoryResult, executorResult] = results;
     if (clientInfoResult.status === 'fulfilled') {
       // loadClientInfo 已写入 state.client
     }
@@ -5015,6 +5041,7 @@ Start-Process -FilePath '.\DSH-Moments-Client.exe' -Verb RunAs`, note: '启动�
     }
 
     root.appendChild(buildAutonomyScheduleCard(automationResult));
+    root.appendChild(buildDesktopConnectionCard(executorResult));
     root.appendChild(buildWritingSkillsCard(writingSkillsResult));
     root.appendChild(buildDiscoveryCard(discoveryResult));
     leftCol.appendChild(buildConnectionInfoCard(clientInfoResult));
@@ -5029,6 +5056,35 @@ Start-Process -FilePath '.\DSH-Moments-Client.exe' -Verb RunAs`, note: '启动�
     layout.append(leftCol, rightCol);
     root.appendChild(layout);
     page.replaceChildren(root);
+  }
+
+  function buildDesktopConnectionCard(result) {
+    const local = result.status === 'fulfilled' ? result.value : null;
+    const config = state.config && state.config.desktopExecutor;
+    const remote = (state.health && state.health.desktopExecutor) || {};
+    const health = local && local.health;
+    const enabled = !!(config && config.enabled);
+    const endpoint = local && local.embedded ? `http://127.0.0.1:${local.port}` : (config && config.baseUrl);
+    const toggle = h('button', { class: 'btn btn-primary', type: 'button', disabled: !config || !local || !local.embedded || local.restartRequired },
+      enabled ? '停用插件连接' : '验证并启用连接');
+    toggle.addEventListener('click', () => openModal({
+      title: enabled ? '停用桌面执行器连接？' : '连接 EXE 内置执行器？',
+      subtitle: `连接地址：${endpoint}`,
+      content: [h('p', {}, '只修改插件到执行器的连接，不更改发表模式、账号和调度设置。启用前验证令牌和服务，保存后立即生效并在重启后保留。'),
+        h('p', {}, '如果已经开启自动发送并选择允许发表的模式，连接恢复后可能执行队列中的内容；可先暂停自动运行。')],
+      confirmText: enabled ? '停用连接' : '验证并连接',
+      onConfirm: () => api.connectExecutor(!enabled, endpoint),
+      after: () => { toast('桌面连接已保存', '已持久化；服务就绪不代表已经发表。', 'success'); refreshCurrent(true); },
+    }));
+    return h('section', { class: 'card', id: 'desktop-connection-settings' },
+      h('div', { class: 'card-head' }, h('div', {}, h('h3', { class: 'card-title' }, icon('monitor'), '桌面执行器连接'),
+        h('p', { class: 'card-sub' }, '分别检查 EXE 内置服务与 DSH 插件连接；权限、OCR、令牌和启用开关互不等同。'))),
+      h('div', { class: 'card-body' },
+        h('p', {}, local && local.embedded ? `内置服务：运行中 · PID ${local.pid} · 端口 ${local.port}` : '内置服务：未启动或诊断失败，请运行完整 EXE。'),
+        h('p', {}, health ? `管理员：${health.adminPrivilege ? '是' : '否'} · OCR：${health.ocrAvailable ? '可用' : '不可用'} · 驱动：${health.driver}` : '权限与 OCR：尚未取得诊断'),
+        h('p', {}, `插件连接：${config ? (enabled ? '已启用' : '未启用') : '配置未读取'} · ${remote.message || '等待检测'}`),
+        local && local.restartRequired ? h('p', { class: 'field-help' }, '数据目录已改变，当前内置执行器仍使用旧目录；请退出并重新打开 EXE 后再连接。') : null,
+        h('p', { class: 'field-help' }, '需要插件 0.3.1 或更新版本；旧插件请先更新并重载。启用失败时按具体提示检查服务或令牌，无需重复提权。'), toggle));
   }
 
   function buildPublishModeCard() {

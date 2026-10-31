@@ -205,6 +205,12 @@ export class AdminServer {
     if (method === 'GET' && pathname === '/api/publish-mode') {
       this.send(response, 200, { ok: true, data: runtime.publishModeView() }); return;
     }
+    if (method === 'GET' && pathname === '/api/desktop-connection') {
+      this.send(response, 200, { ok: true, data: runtime.desktopConnectionView() }); return;
+    }
+    if (method === 'POST' && pathname === '/api/desktop-connection') {
+      this.send(response, 200, { ok: true, data: await runtime.updateDesktopConnection(await this.readBody(request)) }); return;
+    }
     if (method === 'GET' && pathname === '/api/writing-skills') {
       this.send(response, 200, { ok:true, data:runtime.writingSkillsView() }); return;
     }

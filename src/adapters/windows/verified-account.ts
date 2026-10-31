@@ -12,7 +12,8 @@ export function withVerifiedWechatAccount(
       if (status.accountId !== null || !status.running || !status.loggedIn || wechat === null) return status;
       try {
         const before = await wechat.getAccount();
-        if (before === null || (await wechat.checkHealth()).status !== 'ok') return status;
+        const health = await (wechat.checkIdentityHealth ? wechat.checkIdentityHealth() : wechat.checkHealth());
+        if (before === null || health.status !== 'ok') return status;
         const after = await wechat.getAccount();
         if (after === null || before.accountId !== after.accountId || before.ownWxid !== after.ownWxid) return status;
         return { ...status, accountId: after.accountId,

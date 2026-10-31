@@ -43,7 +43,7 @@ SETUP_STATE_PATH = CLIENT_ROOT / "setup-state.json"
 DEFAULT_ADMIN_URL = "http://127.0.0.1:18766"
 DEFAULT_TOKEN_FILE = PROJECT_ROOT / "data" / "admin-token.txt"
 DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
-VERSION = "1.2.0"
+VERSION = "1.2.3"
 _discovery_cache = None
 _discovery_cache_at = 0.0
 MAX_BODY = 16 * 1024 * 1024
@@ -173,6 +173,20 @@ def save_settings(base_url: str, token_file: str, data_dir: str) -> None:
     os.replace(temporary, CONFIG_PATH)
 
 
+def startup_settings() -> dict:
+    """The portable template is not a user-selected connection. Discover it too."""
+    settings = load_settings()
+    is_default = (settings["baseUrl"] == DEFAULT_ADMIN_URL
+                  and Path(settings["dataDir"]).resolve() == DEFAULT_DATA_DIR.resolve()
+                  and Path(settings["tokenFile"]).resolve() == DEFAULT_TOKEN_FILE.resolve())
+    if not CONFIG_PATH.is_file() or (is_default and not DEFAULT_TOKEN_FILE.is_file()):
+        from client.discovery import discover
+        detected = discover(PROJECT_ROOT).get("suggestedClientConfig")
+        if detected:
+            settings.update({key: detected[key] for key in ("baseUrl", "tokenFile", "dataDir")})
+    return settings
+
+
 def load_setup_state() -> dict:
     """首次配置教程的持久化进度；只存布尔步骤与完成时间，不含任何凭据。"""
     default = {"version": 1, "completed": False, "completedAt": None, "steps": {}}
@@ -216,7 +230,7 @@ def first_run_status() -> dict:
     config_missing = not CONFIG_PATH.is_file()
     setup_completed = bool(load_setup_state().get("completed"))
     return {
-        "firstRun": bool(config_missing or not setup_completed),
+        "firstRun": not setup_completed,
         "setupCompleted": setup_completed,
         "configMissing": bool(config_missing),
     }
@@ -426,12 +440,22 @@ def write_client_config_for_plan(state: "ClientState", plan, summary: dict) -> d
         return result
     base_url = (state.admin_url or DEFAULT_ADMIN_URL).rstrip("/")
     token_file = str(Path(data_dir) / "admin-token.txt")
-    save_settings(base_url, token_file, data_dir)
-    # 让代理立即从新位置读取管理令牌，不再要求重启客户端。
-    state.admin_url = base_url
-    state.token_file = Path(token_file)
-    state.data_dir = Path(data_dir)
-    result.update(updated=True, baseUrl=base_url, tokenFile=token_file, dataDir=data_dir)
+    executor = getattr(state, "executor", None)
+    restart_required = executor is not None and Path(executor.app.config.token_file).resolve().parent != Path(data_dir).resolve()
+    lock = executor.app._exec_lock if restart_required else None
+    if lock is not None and not lock.acquire(blocking=False):
+        raise ValueError("执行器正在操作微信，请完成后再更新客户端数据目录")
+    try:
+        if restart_required:
+            apply_executor_mode(executor, "PREPARE_ONLY")
+        save_settings(base_url, token_file, data_dir)
+        state.admin_url = base_url
+        state.token_file = Path(token_file)
+        state.data_dir = Path(data_dir)
+    finally:
+        if lock is not None:
+            lock.release()
+    result.update(updated=True, baseUrl=base_url, tokenFile=token_file, dataDir=data_dir, restartRequired=restart_required)
     return result
 
 
@@ -701,12 +725,12 @@ class Handler(BaseHTTPRequestHandler):
             "health": health, "status": status,
             "accountConfigured": bool(executor.app.config.expected_account_id),
             "declaredVersion": executor.app.config.assumed_client_version,
+            "restartRequired": Path(executor.app.config.token_file).resolve().parent != self.state.data_dir.resolve(),
         }})
 
     def _client_config(self) -> None:
-        settings = load_settings()
-        if not CONFIG_PATH.is_file():
-            settings = {"baseUrl": self.state.admin_url, "tokenFile": str(self.state.token_file), "dataDir": str(self.state.data_dir)}
+        # Report the effective connection, including startup discovery/CLI overrides.
+        settings = {"baseUrl": self.state.admin_url, "tokenFile": str(self.state.token_file), "dataDir": str(self.state.data_dir)}
         self._send_json(200, {"ok": True, "data": {"baseUrl": settings["baseUrl"], "tokenFile": settings["tokenFile"], "dataDir": settings["dataDir"]}})
 
     def _discover_environment(self) -> None:
@@ -931,12 +955,15 @@ class Handler(BaseHTTPRequestHandler):
             return public
         # 写入完成后旧的首次启动检测缓存已过期（changedFields/configMissing 可能变化）。
         _first_run_detection.reset()
+        if written.get("restartRequired"):
+            warnings.append("客户端数据目录已更新；内置执行器暂保持仅准备，请退出并重新打开 EXE 以使用新令牌和账号。")
         home = getattr(plan, "userHome", "") or ""
         return {
             "updated": True,
             "baseUrl": written["baseUrl"],
             "tokenFile": redact_home_path(written["tokenFile"], home),
             "dataDir": redact_home_path(written["dataDir"], home),
+            "restartRequired": written.get("restartRequired", False),
         }
 
     def _auto_configure_post(self) -> None:
@@ -1278,12 +1305,7 @@ def main(argv: list[str] | None = None) -> int:
             dpi(ctypes.c_void_p(-4))
         except (AttributeError, OSError):
             pass
-    settings = load_settings()
-    if not CONFIG_PATH.is_file():
-        from client.discovery import discover
-        detected = discover(PROJECT_ROOT).get("suggestedClientConfig")
-        if detected:
-            settings.update({key: detected[key] for key in ("baseUrl", "tokenFile", "dataDir")})
+    settings = startup_settings()
     parser = argparse.ArgumentParser(description="DSH Moments Agent Web 客户端")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18770)

@@ -81,7 +81,7 @@ export class HttpDesktopExecutor implements DesktopExecutor {
       throw new MomentsError('DESKTOP_UNAVAILABLE', '桌面执行器不可达', {
         retryable: true,
         cause: error,
-        details: { hint: '请确认 python desktop/server.py 已启动且端口一致' },
+        details: { hint: '请启动完整 EXE，并确认插件连接地址、数据目录与内置执行器一致' },
       });
     }
     if (response.status === 401) {
@@ -109,7 +109,7 @@ export class HttpDesktopExecutor implements DesktopExecutor {
         uiaAvailable: false,
         allowPublish: false,
         mode: 'PREPARE_ONLY',
-        message: '桌面执行器未启用',
+        message: '插件未启用桌面连接（desktopExecutor.enabled=false）；请在设置 → 桌面执行器连接中启用。EXE 内置服务可能已正常运行，这不是管理员权限错误。',
       };
     }
     try {
@@ -123,6 +123,11 @@ export class HttpDesktopExecutor implements DesktopExecutor {
         allowPublish: raw.allowPublish === true,
         mode: String(raw.mode ?? 'PREPARE_ONLY'),
         message: String(raw.message ?? ''),
+        driver: typeof raw.driver === 'string' ? raw.driver : 'uia',
+        ocrAvailable: raw.ocrAvailable === true,
+        adminPrivilege: raw.adminPrivilege === true,
+        geometryRequireAdmin: raw.geometryRequireAdmin === true,
+        processDpiAwareness: typeof raw.processDpiAwareness === 'string' ? raw.processDpiAwareness : null,
       };
     } catch (error) {
       return {

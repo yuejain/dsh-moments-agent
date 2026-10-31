@@ -1,5 +1,5 @@
 param(
-  [string]$Path = (Join-Path (Split-Path -Parent $PSScriptRoot) 'release\DSH-Moments-Client-1.2.0-win64-exe\DSH-Moments-Client.exe'),
+  [string]$Path = (Join-Path (Split-Path -Parent $PSScriptRoot) 'release\DSH-Moments-Client-1.2.3-win64-exe\DSH-Moments-Client.exe'),
   [string]$Thumbprint = 'D54E26CAE38C7C302FE583A7C3360A93C5C1EA5B'
 )
 $ErrorActionPreference = 'Stop'

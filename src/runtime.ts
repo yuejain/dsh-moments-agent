@@ -32,6 +32,7 @@ import type {
 import { parseConfig, type MomentsConfig } from './config.js';
 import { PUBLISH_MODES } from './domain/types.js';
 import { withVerifiedWechatAccount } from './adapters/windows/verified-account.js';
+import { HttpDesktopExecutor } from './adapters/windows/desktop-client.js';
 import type {
   ImageFacade,
   LlmClient,
@@ -159,6 +160,15 @@ export class MomentsRuntime {
 
   constructor(private readonly deps: RuntimeDeps) {
     this.writingSkillLibrary = new WritingSkillLibrary(deps.packageRoot, deps.logger);
+    // Keep this object: HttpDesktopExecutor holds the same reference.
+    const savedDesktop = deps.store.getSetting('desktop_connection');
+    const desktop = parseConfig({ ...deps.config, desktopExecutor: {
+      ...deps.config.desktopExecutor, ...(savedDesktop ? JSON.parse(savedDesktop) : {}),
+    } }).desktopExecutor;
+    desktop.tokenFile = desktop.tokenFile === null
+      ? path.join(deps.dataDir, 'desktop-token.txt')
+      : path.resolve(deps.packageRoot, desktop.tokenFile);
+    Object.assign(deps.config.desktopExecutor, desktop);
     const savedMode = deps.store.getSetting('publish_mode');
     if (savedMode && PUBLISH_MODES.includes(savedMode as PublishMode)) {
       deps.config.publishMode = savedMode as PublishMode;
@@ -390,6 +400,45 @@ export class MomentsRuntime {
     return { mode: this.deps.config.publishMode, requireApproval: this.deps.config.publishMode === 'APPROVAL_REQUIRED' };
   }
 
+  desktopConnectionView() {
+    const config = this.deps.config.desktopExecutor;
+    return { enabled: config.enabled, baseUrl: config.baseUrl, tokenFile: config.tokenFile };
+  }
+
+  private desktopConnectionUpdating = false;
+
+  async updateDesktopConnection(input: Record<string, unknown>) {
+    if (Object.keys(input).some(key => !['enabled', 'baseUrl'].includes(key)) || typeof input.enabled !== 'boolean') {
+      throw new MomentsError('INVALID_INPUT', '桌面连接仅接受 enabled 与本机 baseUrl，不修改发表权限');
+    }
+    const checkIdle = () => {
+      if (this.publisher.isBusy || this.deps.store.listTasks(['PREPARING', 'PREPARED', 'PUBLISHING'], 1).length) {
+        throw new MomentsError('CONFLICT', '存在准备中、已准备或发表中的任务，暂不能修改桌面连接');
+      }
+    };
+    if (this.desktopConnectionUpdating) throw new MomentsError('CONFLICT', '正在验证桌面连接，请稍后重试');
+    checkIdle();
+    this.desktopConnectionUpdating = true;
+    try {
+      const next = parseConfig({ ...this.deps.config, desktopExecutor: {
+        ...this.deps.config.desktopExecutor, ...input,
+      } }).desktopExecutor;
+      if (next.enabled) {
+        const health = await new HttpDesktopExecutor(next, this.env).health();
+        if (!health.ok) throw new MomentsError('DESKTOP_UNAVAILABLE', health.message);
+      }
+      checkIdle();
+      this.deps.store.runInTransaction(() => {
+        this.deps.store.setSetting('desktop_connection', JSON.stringify({ enabled: next.enabled, baseUrl: next.baseUrl }));
+        this.deps.store.appendAudit({ at: this.iso(), actor: 'owner', action: 'desktop_connection_changed', taskId: null,
+          previousState: null, nextState: null, reason: '所有者配置桌面执行器连接',
+          metadata: { enabled: next.enabled, baseUrl: next.baseUrl } });
+      });
+      Object.assign(this.deps.config.desktopExecutor, next);
+      return this.desktopConnectionView();
+    } finally { this.desktopConnectionUpdating = false; }
+  }
+
   updatePublishMode(input: Record<string, unknown>): ReturnType<MomentsRuntime['publishModeView']> {
     const mode = input.mode as PublishMode;
     if (!PUBLISH_MODES.includes(mode)) throw new MomentsError('INVALID_INPUT', '发表模式必须是三级选项之一');
@@ -486,7 +535,9 @@ export class MomentsRuntime {
       desktopHealth === null
         ? { status: 'unavailable', message: '桌面执行器不可用' }
         : {
-            status: !desktopHealth.ok ? 'unavailable' : desktopHealth.wechatInstalled ? 'degraded' : 'not_configured',
+            status: !desktopHealth.ok ? 'unavailable' : !desktopHealth.wechatInstalled ? 'not_configured'
+              : (desktopHealth.driver === 'geometry' ? desktopHealth.ocrAvailable &&
+                (!desktopHealth.geometryRequireAdmin || desktopHealth.adminPrivilege) : desktopHealth.uiaAvailable) ? 'ok' : 'degraded',
             message: desktopHealth.message,
             details: {
               version: desktopHealth.version,
@@ -495,6 +546,11 @@ export class MomentsRuntime {
               uiaAvailable: desktopHealth.uiaAvailable,
               allowPublish: desktopHealth.allowPublish,
               mode: desktopHealth.mode,
+              driver: desktopHealth.driver,
+              ocrAvailable: desktopHealth.ocrAvailable,
+              adminPrivilege: desktopHealth.adminPrivilege,
+              geometryRequireAdmin: desktopHealth.geometryRequireAdmin,
+              processDpiAwareness: desktopHealth.processDpiAwareness,
             },
           };
     const counts = this.deps.store.countTasksByState();
